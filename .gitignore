@@ -1,0 +1,17 @@
+# Raw data lives in the Databricks volume (workspace.bronze.raw_files), not in git
+*.zip
+weather/
+data/
+
+# Python / IDE
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.venv/
+.vscode/
+.idea/
+.DS_Store
+
+# Secrets
+.databrickscfg
+.env
