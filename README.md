@@ -8,13 +8,14 @@ Platform: Databricks Free Edition (Unity Catalog, Delta Lake, MLflow, Jobs) + Po
 
 | Path | Contents |
 |---|---|
-| `notebooks/01_bronze_ingestion.py` | Raw zips in the volume → `workspace.bronze.*` Delta tables |
+| `notebooks/00_setup.sql` | Creates the catalog, schemas and `raw_files` volume (re-runnable) |
+| `notebooks/01_bronze_ingestion.py` | Raw zips in the volume → `wildfire_project.bronze.*` Delta tables |
 
 Notebooks are stored in Databricks source format (`.py`) so they diff cleanly in git and open as notebooks in Databricks Git folders.
 
 ## Data
 
-Raw data is **not** committed. It is uploaded to the Unity Catalog volume `workspace.bronze.raw_files`:
+Raw data is **not** committed. It is uploaded to the Unity Catalog volume `wildfire_project.bronze.raw_files`:
 
 | File | Source |
 |---|---|

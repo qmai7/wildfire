@@ -1,4 +1,4 @@
-# Raw data lives in the Databricks volume (workspace.bronze.raw_files), not in git
+# Raw data lives in the Databricks volume (wildfire_project.bronze.raw_files), not in git
 *.zip
 weather/
 data/

@@ -1,4 +1,8 @@
 # Databricks notebook source
+# /// script
+# [tool.databricks.environment]
+# environment_version = "6"
+# ///
 # MAGIC %md
 # MAGIC # 01 — Bronze Ingestion
 # MAGIC
@@ -6,8 +10,8 @@
 # MAGIC
 # MAGIC | Source | Raw file | Bronze table |
 # MAGIC |---|---|---|
-# MAGIC | SOPFEU wildfire origin points (Shapefile, 1972–2024) | `Feux_pt_ori_SHP.zip` | `workspace.bronze.fires_raw` |
-# MAGIC | ECCC daily weather, 3 stations × 2000–2025 (CSV) | `weather_2000_2025.zip` | `workspace.bronze.weather_daily_raw` |
+# MAGIC | SOPFEU wildfire origin points (Shapefile, 1972–2024) | `Feux_pt_ori_SHP.zip` | `wildfire_project.bronze.fires_raw` |
+# MAGIC | ECCC daily weather, 3 stations × 2000–2025 (CSV) | `weather_2000_2025.zip` | `wildfire_project.bronze.weather_daily_raw` |
 # MAGIC
 # MAGIC Bronze rules followed here:
 # MAGIC - All values stored as **strings**, exactly as in the source (type casting happens in Silver).
@@ -22,14 +26,16 @@
 
 # COMMAND ----------
 
+import io
 import re
 import zipfile
 from pathlib import Path
 
 import geopandas as gpd
+from databricks.sdk import WorkspaceClient
 from pyspark.sql import functions as F
 
-CATALOG = "workspace"
+CATALOG = "wildfire_project"
 VOLUME_DIR = f"/Volumes/{CATALOG}/bronze/raw_files"
 EXTRACT_DIR = f"{VOLUME_DIR}/extracted"
 
@@ -43,13 +49,23 @@ WEATHER_TABLE = f"{CATALOG}.bronze.weather_daily_raw"
 
 # MAGIC %md
 # MAGIC ## 1. Unzip raw files into the volume
+# MAGIC
+# MAGIC `zipfile.extractall` cannot write directly to a volume on serverless, so each zip is read as bytes with Spark
+# MAGIC and every member is uploaded through the Databricks SDK Files API.
 
 # COMMAND ----------
 
+w = WorkspaceClient()
+
 for zip_path, target in [(FIRES_ZIP, f"{EXTRACT_DIR}/fires"), (WEATHER_ZIP, f"{EXTRACT_DIR}/weather")]:
-    Path(target).mkdir(parents=True, exist_ok=True)
-    with zipfile.ZipFile(zip_path) as z:
-        z.extractall(target)
+    zip_bytes = spark.read.format("binaryFile").load(zip_path).select("content").first()["content"]
+    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as z:
+        for info in z.infolist():
+            if info.is_dir():
+                continue
+            file_path = f"{target}/{info.filename}"
+            dbutils.fs.mkdirs(file_path.rsplit("/", 1)[0])
+            w.files.upload(file_path=file_path, contents=io.BytesIO(z.read(info.filename)), overwrite=True)
     print(f"{zip_path} -> {target}")
 
 display(dbutils.fs.ls(f"{EXTRACT_DIR}/fires"))
