@@ -338,22 +338,24 @@ FLAGS = [
     "max_temp_flag", "min_temp_flag", "mean_temp_flag", "heat_deg_days_flag", "cool_deg_days_flag",
     "total_rain_flag", "total_snow_flag", "total_precip_flag", "snow_on_grnd_flag",
 ]
+
 EMPTY_COLS = ["dir_of_max_gust_10s_deg", "spd_of_max_gust_km_h", "dir_of_max_gust_flag", "spd_of_max_gust_flag", "data_quality"]
 
 weather_bronze = spark.table(BRONZE_WEATHER)
 
+# Dropped: year/month/day (fully determined by date)
 weather_typed = weather_bronze.select(
-    F.trim("climate_id").alias("climate_id"),
-    F.trim("station_name").alias("station_name"),
-    F.expr("try_cast(latitude_y AS DOUBLE)").alias("latitude"),
-    F.expr("try_cast(longitude_x AS DOUBLE)").alias("longitude"),
-    F.to_date("date_time", "yyyy-MM-dd").alias("date"),
-    *[F.expr(f"try_cast({c} AS DOUBLE)").alias(c) for c in MEASURES],
-    *[F.when(F.trim(F.col(c)) != "", F.trim(F.col(c))).alias(c) for c in FLAGS],
+    clean_str("climate_id").alias("climate_id"),
+    clean_str("station_name").alias("station_name"),
+    clean_str("latitude_y").try_cast("double").alias("latitude"),
+    clean_str("longitude_x").try_cast("double").alias("longitude"),
+    F.to_date(clean_str("date_time"), "yyyy-MM-dd").alias("date"),
+    *[clean_str(c).try_cast("double").alias(c) for c in MEASURES],
+    *[clean_str(c).alias(c) for c in FLAGS]
 )
 
-# Dropped: year/month/day (fully determined by date) and the columns profiled as 100% empty below.
 assert weather_typed.select("climate_id", "date").distinct().count() == weather_typed.count(), "(climate_id, date) is not unique"
+# 3 stations x 9,497 days 
 print(f"{weather_typed.count():,} station-days")
 
 # COMMAND ----------
@@ -361,23 +363,55 @@ print(f"{weather_typed.count():,} station-days")
 # MAGIC %md
 # MAGIC ## 2.2 Null profiling
 # MAGIC
-# MAGIC ECCC marks some missing values with the flag `M`. Other values are simply blank with no flag — typically when a station was not reporting at all.
-# MAGIC Other flags: `E` = estimated, `T` = trace (precipitation too small to measure, stored as 0.0), `C` = precipitation occurred but amount uncertain.
+# MAGIC Each measure column (e.g. `total_precip_mm`) has a companion flag column (e.g. `total_precip_flag`).
+# MAGIC The flag is ECCC's metadata about **how each value was obtained** — not just whether it is missing:
+# MAGIC
+# MAGIC | Flag | Meaning | Value in measure column |
+# MAGIC |---|---|---|
+# MAGIC | `M` | Missing — station was operating but this specific measurement was not recorded (instrument failure, data not collected) | NULL |
+# MAGIC | (no flag) | Station was not reporting at all — no data for that entire day | NULL |
+# MAGIC | `E` | Estimated — value is present but was derived, not directly measured | A number |
+# MAGIC | `T` | Trace — precipitation too small to measure, stored as 0.0 | 0.0 |
+# MAGIC | `C` | Precipitation occurred but amount is uncertain | A number |
+# MAGIC
+# MAGIC ### Why the distinction matters
+# MAGIC
+# MAGIC A NULL in a measure column can arise in two ways, and the flag tells us which:
+# MAGIC
+# MAGIC 1. **Flag = `M`** → the station was active that day but the instrument failed for this variable.
+# MAGIC    The gap is typically short (a day or two), so interpolating from neighbouring days is reasonable.
+# MAGIC 2. **No flag (NULL)** → the station was offline entirely (not reporting any data).
+# MAGIC    These gaps can span weeks or months, so interpolating would mean inventing weather fiction.
+# MAGIC
+# MAGIC This distinction drives the null-handling strategy in 2.4: short gaps with an `M` flag are good
+# MAGIC candidates for linear interpolation, while long gaps with no flag are left null and deferred to Gold.
+# MAGIC For example, station 7063560 has 3,473 missing precipitation days with no flag versus only 353 with `M` —
+# MAGIC indicating the station had long offline periods rather than isolated instrument failures.
 
 # COMMAND ----------
 
+# Display NULL columns and its count
 empty_profile = weather_bronze.select(
     *[F.sum(F.when(F.trim(F.col(c)) != "", 0).otherwise(1)).alias(c) for c in EMPTY_COLS]
 )
 display(empty_profile)
 
 total_rows = weather_bronze.count()
+
 for c, v in empty_profile.first().asDict().items():
+    # Assertion to ensure that the entire column is empty before dropping it
     assert v == total_rows, f"{c} is not entirely empty"
     log("weather", "drop column", c, v, "dropped: 100% missing")
 
 # COMMAND ----------
 
+# MAGIC %md
+# MAGIC ### Table 1: Missing counts per station for every measure column
+# MAGIC Every station has 9,497 days total. Sorel (7063560) is the worst — roughly 40% missing for most columns.
+
+# COMMAND ----------
+
+# for each station, count how many NULLs each measure column has, and also count the total number of days
 def null_summary(df, cols):
     return (
         df.groupBy("climate_id")
@@ -386,6 +420,22 @@ def null_summary(df, cols):
     )
 
 display(null_summary(weather_typed, MEASURES))
+
+
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### Table 2: Missing values split by whether the flag is M or absent
+# MAGIC
+# MAGIC
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC This is the key insight: for Sorel, 3,473 missing precipitation/max_temp days have **no flag** vs only 353/640 with M. That means Sorel wasn't reporting at all for long stretches — it wasn't just instrument failures on active days.
+
+# COMMAND ----------
 
 # Missing values with vs without the ECCC 'M' flag
 display(
@@ -400,7 +450,9 @@ display(
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC Missing days per station and year (max temperature) — shows whether gaps are scattered or a station stopped reporting for whole years.
+# MAGIC ### Table 3: Missing days per station and year (max temperature) — 
+# MAGIC
+# MAGIC shows whether gaps are scattered or a station stopped reporting for whole years.
 
 # COMMAND ----------
 
@@ -410,6 +462,18 @@ display(
     .groupBy("year").pivot("station_name").sum("missing_max_temp")
     .orderBy("year")
 )
+
+# COMMAND ----------
+
+# DBTITLE 1,Key takeaways from missing-days table
+# MAGIC %md
+# MAGIC ### Key takeaways from the missing-days table
+# MAGIC
+# MAGIC * **Lac Bouchette** — 365 missing days every year from 2016 onward. The station stopped reporting entirely in 2016; all post-2015 data is absent.
+# MAGIC * **Sorel** — gaps concentrated in 2011–2015 (up to 10 days/year). Before and after that window, the station reports reliably.
+# MAGIC * **Les Buissons** — scattered gaps throughout (0–311 days/year), with the worst stretch in 2012–2016. Never a full year offline.
+# MAGIC
+# MAGIC **Implication for null handling (2.4):** Lac Bouchette's post-2016 gaps are long offline periods (no `M` flag) and will be left null — interpolating a year of invented temperatures would be fiction. The shorter, `M`-flagged gaps at the other stations are candidates for **interpolation** or **group-mean imputation**.
 
 # COMMAND ----------
 
@@ -425,7 +489,9 @@ fd_check = weather_typed.groupBy("climate_id").agg(
     F.countDistinct("latitude").alias("latitudes"),
     F.countDistinct("longitude").alias("longitudes"),
 )
+# Check functional dependency climate_id -> station_name, lat, long
 assert fd_check.filter("names > 1 OR latitudes > 1 OR longitudes > 1").count() == 0, "climate_id does not determine station attributes"
+
 
 silver_stations = weather_typed.groupBy("climate_id").agg(
     F.first("station_name").alias("station_name"),
