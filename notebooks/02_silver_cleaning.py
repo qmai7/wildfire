@@ -10,7 +10,7 @@
 # MAGIC
 # MAGIC | Input (Bronze) | Output (Silver) | Key |
 # MAGIC |---|---|---|
-# MAGIC | `bronze.fires_raw` | `silver.fires` | `cle` |
+# MAGIC | `bronze.fires_raw` | `silver.fires` | `fire_id` |
 # MAGIC | `bronze.weather_daily_raw` | `silver.weather_daily` | (`climate_id`, `date`) |
 # MAGIC | `bronze.weather_daily_raw` | `silver.weather_stations` | `climate_id` |
 # MAGIC | — | `silver.cleaning_log` | every cleaning action and how many rows it affected |
@@ -55,6 +55,9 @@ def log(dataset, step, column, rows, action):
 # MAGIC
 # MAGIC Bronze stores everything as strings, and GeoPandas writes missing values as the text `nan`, `None` or `NaT`.
 # MAGIC These **disguised nulls** would not be caught by `IS NULL`, so they are counted first and converted to real nulls.
+# MAGIC
+# MAGIC **Column names and categorical values are standardized to English** (e.g. `ANNEE` → `year`, `SUP_HA` → `area_ha`;
+# MAGIC `Foudre` → `Lightning`, `Humaine` → `Human`, `Nordique` → `Nordic`) for consistency with the weather dataset.
 
 # COMMAND ----------
 
@@ -72,9 +75,10 @@ display(
 # COMMAND ----------
 
 def clean_str(c):
-    """Trim, and turn disguised null markers into real nulls."""
+    """Trim, and turn disguised null markers into real nulls (None)."""
     s = F.trim(F.col(c))
-    return F.when(s.isin(NULL_MARKERS), None).otherwise(s)
+    return F.when(
+        s.isin(NULL_MARKERS), None).otherwise(s)
 
 def parse_date(c):
     """Shapefile dates may arrive as 'yyyyMMdd' or 'yyyy-MM-dd' depending on the reader; accept both."""
@@ -87,15 +91,18 @@ def parse_date(c):
 fires_typed = (
     fires_bronze
     .select(
-        clean_str("CLE").alias("cle"),
-        F.expr("try_cast(trim(ANNEE) AS INT)").alias("annee"),
-        F.expr("try_cast(trim(NOFEU) AS INT)").alias("nofeu"),
-        clean_str("SECTION").alias("section"),
-        clean_str("CAUSE").alias("cause"),
-        parse_date("DATE_DEBUT").alias("date_debut"),
-        parse_date("DATE_RAPPO").alias("date_rappo"),
-        parse_date("DATE_ETEIN").alias("date_etein"),
-        F.expr("try_cast(trim(SUP_HA) AS DOUBLE)").alias("sup_ha"),
+        clean_str("CLE").alias("fire_id"),
+        F.expr("try_cast(trim(ANNEE) AS INT)").alias("year"),
+        F.expr("try_cast(trim(NOFEU) AS INT)").alias("fire_number"),
+        F.when(clean_str("SECTION") == "Nordique", "Nordic")
+         .otherwise(clean_str("SECTION")).alias("section"),
+        F.when(clean_str("CAUSE") == "Foudre", "Lightning")
+         .when(clean_str("CAUSE") == "Humaine", "Human")
+         .otherwise(clean_str("CAUSE")).alias("cause"),
+        parse_date("DATE_DEBUT").alias("start_date"),
+        parse_date("DATE_RAPPO").alias("report_date"),
+        parse_date("DATE_ETEIN").alias("extinction_date"),
+        F.expr("try_cast(trim(SUP_HA) AS DOUBLE)").alias("area_ha"),
         F.expr("try_cast(trim(LATITUDE) AS DOUBLE)").alias("latitude"),
         F.expr("try_cast(trim(LONGITUDE) AS DOUBLE)").alias("longitude"),
     )
@@ -103,9 +110,11 @@ fires_typed = (
 
 # Dropped: OBJECTID (not an identifier — 0 for most rows) and geometry_wkt (redundant: fully determined by latitude/longitude).
 n_all = fires_typed.count()
-fires_typed = fires_typed.filter(F.col("annee").between(YEAR_MIN, YEAR_MAX))
+fires_typed = fires_typed.filter(F.col("year").between(YEAR_MIN, YEAR_MAX))
 n_scope = fires_typed.count()
-log("fires", "filter", "annee", n_all - n_scope, f"removed: outside project scope {YEAR_MIN}-{YEAR_MAX}")
+log("fires", "filter", "year", n_all - n_scope, f"removed: outside project scope {YEAR_MIN}-{YEAR_MAX}")
+log("fires", "translate", "cause", n_scope, "Foudre -> Lightning, Humaine -> Human")
+log("fires", "translate", "section", n_scope, "Nordique -> Nordic")
 log("fires", "drop column", "OBJECTID, geometry_wkt", n_scope, "dropped: non-identifier / redundant with latitude+longitude")
 print(f"{n_scope:,} fires in scope")
 
@@ -130,36 +139,34 @@ for c, v in null_counts.first().asDict().items():
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ### Disguised nulls: `sup_ha = 0`
+# MAGIC ### Disguised nulls: `area_ha = 0`
 # MAGIC
 # MAGIC About 40% of fires report a burned area of exactly 0 ha. Before accepting that, check whether 0 is used as a placeholder for "unknown":
 # MAGIC - If it were a placeholder, the share of zeros would typically jump in some years (a change in recording practice).
-# MAGIC - Areas are recorded with 0.1 ha precision, so a fire smaller than 0.05 ha rounds to 0.
+# MAGIC - In 24 of 25 years (2000–2022, 2024), areas are recorded at 0.1 ha precision, so a fire smaller than 0.05 ha rounds to 0.
+# MAGIC - In 2023, areas use full floating-point precision (values like 0.0002 ha appear), so zeros in that year are unambiguously real
+# MAGIC
+# MAGIC The 2023 non-increment values span the full range — from `0.006` ha all the way up to `1,020,559` ha — all at full float precision. So 2023 wasn't just more precise for small fires; its entire recording method changed (likely satellite-derived areas rather than manual estimates rounded to 0.1 ha).
 
 # COMMAND ----------
 
 display(
-    fires_typed.groupBy("annee")
-    .agg(F.count("*").alias("fires"), F.sum((F.col("sup_ha") == 0).cast("int")).alias("zero_area"))
+    fires_typed.groupBy("year")
+    .agg(F.count("*").alias("fires"), 
+         F.sum((F.col("area_ha") == 0).cast("int")).alias("zero_area"))
     .withColumn("zero_share_pct", F.round(100 * F.col("zero_area") / F.col("fires"), 1))
-    .orderBy("annee")
+    .orderBy("year")
 )
 
 display(
-    fires_typed.filter(F.col("sup_ha") < 0.5)
-    .groupBy(F.round("sup_ha", 2).alias("sup_ha")).count().orderBy("sup_ha")
+    fires_typed.filter(F.col("area_ha") < 0.5)
+    .groupBy(F.round("area_ha", 2).alias("area_ha")).count().orderBy("area_ha")
 )
 
 # COMMAND ----------
 
-# MAGIC %md
-# MAGIC **Decision:** zeros are kept as real values (spot fires below the 0.1 ha recording precision). The zero share is stable across years
-# MAGIC (roughly 30–50% every year) and 0.1 ha is by far the most common positive value, which is consistent with rounding rather than a missing-value code.
-
-# COMMAND ----------
-
-log("fires", "disguised null check", "sup_ha", fires_typed.filter(F.col("sup_ha") == 0).count(),
-    "kept: 0 ha = spot fire below 0.1 ha recording precision, not a missing-value code")
+log("fires", "disguised null check", "area_ha", fires_typed.filter(F.col("area_ha") == 0).count(),
+    "kept: 0 ha is a real value, not a missing-value code (24 years at 0.1 ha precision: < 0.05 ha rounds to 0; 2023 full float precision: 0 is genuine)")
 
 # COMMAND ----------
 
@@ -172,22 +179,32 @@ log("fires", "disguised null check", "sup_ha", fires_typed.filter(F.col("sup_ha"
 # COMMAND ----------
 
 # Approximate bounding box of Québec
+# Any fire outside this rectangle is either a data-entry error or a fire from another province that was mislabeled.
 LAT_MIN, LAT_MAX, LON_MIN, LON_MAX = 44.9, 62.6, -79.8, -57.0
 
 rules = {
-    "report_before_start":     F.col("date_rappo") < F.col("date_debut"),
-    "extinction_before_start": F.col("date_etein") < F.col("date_debut"),
-    "start_year_mismatch":     F.year("date_debut") != F.col("annee"),
+    # Fire was reported before it started — impossible chronology
+    "report_before_start":     F.col("report_date") < F.col("start_date"),
+    # Fire was extinguished before it started — impossible chronology
+    "extinction_before_start": F.col("extinction_date") < F.col("start_date"),
+    # The start date's year doesn't match the recorded fire year 
+    "start_year_mismatch":     F.year("start_date") != F.col("year"),
+    # Coordinate is outside Québec — wrong location or wrong dataset
     "outside_quebec":          ~F.col("latitude").between(LAT_MIN, LAT_MAX) | ~F.col("longitude").between(LON_MIN, LON_MAX),
-    "negative_area":           F.col("sup_ha") < 0,
+    # Negative burned area
+    "negative_area":           F.col("area_ha") < 0,
 }
+# Counting violations
+violations = fires_typed.select(
+    *[F.sum(F.coalesce(cond, F.lit(False)).cast("int")).alias(name) 
+      for name, cond in rules.items()])
 
-violations = fires_typed.select(*[F.sum(F.coalesce(cond, F.lit(False)).cast("int")).alias(name) for name, cond in rules.items()])
 display(violations)
 
 for name, v in violations.first().asDict().items():
     log("fires", "validity rule", name, v, "flagged is_valid = false" if v else "no violations")
 
+# Adding is_valid flag to the dataset in case any rows that violate any domain rule are flagged invalid
 is_valid = ~F.greatest(*[F.coalesce(cond, F.lit(False)) for cond in rules.values()])
 fires_checked = fires_typed.withColumn("is_valid", is_valid)
 
@@ -198,61 +215,110 @@ fires_checked = fires_typed.withColumn("is_valid", is_valid)
 # MAGIC
 # MAGIC Burned area is extremely right-skewed (median 0.1 ha, maximum over 1 million ha), so three methods are compared:
 # MAGIC 1. **IQR on raw values** — the fence collapses to a few hectares and flags thousands of ordinary fires.
+# MAGIC - Why it fails here: with 40% zeros, Q1 is 0 and Q3 is only a few hectares. The fence lands at a few hectares and flags thousands of ordinary fires. It’s included as the baseline that shows the problem.
 # MAGIC 2. **IQR on log10(area)** — the standard fix for skewed data; flags only the genuinely large fires.
+# MAGIC - Idea: apply the same Tukey fence after taking log10 of the area, then convert the fence back with 10 ** fence.
+# MAGIC - Why it works: a log scale turns multiplication into addition. 0.1 → 1 → 10 → 100 → 1,000 ha become equally spaced steps (−1, 0, 1, 2, 3). The skewed distribution becomes much more symmetric, so the 1.5 × IQR rule behaves as designed.
 # MAGIC 3. **Z-score (|z| > 3) on log10(area)** — for comparison.
+# MAGIC
+# MAGIC Please note that for Z-score: the mean and standard deviation are themselves inflated by extreme values, so the fence tends to sit higher than the IQR fence and flags fewer fires.
 
 # COMMAND ----------
 
-q1, q3 = fires_checked.approxQuantile("sup_ha", [0.25, 0.75], 0.0)
+# DBTITLE 1,area_ha distribution
+display(
+    fires_checked.select("area_ha")
+    .summary("count", "min", "25%", "50%", "75%", "max", "mean", "stddev")
+)
+
+# COMMAND ----------
+
+# displays the 10 largest fires in the dataset
+display(fires_checked.orderBy(F.desc("area_ha")).limit(10))
+
+# COMMAND ----------
+
+q1, q3 = fires_checked.approxQuantile("area_ha", [0.25, 0.75], 0.0)
 raw_fence = q3 + 1.5 * (q3 - q1)
 
-positive = fires_checked.filter(F.col("sup_ha") > 0).withColumn("log_ha", F.log10("sup_ha"))
+# takes base-10 logarithm of each area. This transforms the highly skewed distribution into something more symmetric: 0.1 → -1, 1 → 0, 10 → 1, 100 → 2, 1000 → 3.
+positive = fires_checked.filter(F.col("area_ha") > 0).withColumn("log_ha", F.log10("area_ha"))
+# lq1 = -1 (0.1 ha) & lq3 = 0 (1 ha)
 lq1, lq3 = positive.approxQuantile("log_ha", [0.25, 0.75], 0.0)
+# Take the Tukey IQR fence formula and apply it to the log-transformed data
+# Convert the fence back from log units to hectares
 log_fence_ha = 10 ** (lq3 + 1.5 * (lq3 - lq1))
 mu, sd = positive.select(F.mean("log_ha"), F.stddev("log_ha")).first()
 z_fence_ha = 10 ** (mu + 3 * sd)
 
 comparison = spark.createDataFrame(
     [
-        ("IQR on raw sup_ha", float(raw_fence), fires_checked.filter(F.col("sup_ha") > raw_fence).count()),
-        ("IQR on log10(sup_ha)", float(log_fence_ha), fires_checked.filter(F.col("sup_ha") > log_fence_ha).count()),
-        ("z-score > 3 on log10(sup_ha)", float(z_fence_ha), fires_checked.filter(F.col("sup_ha") > z_fence_ha).count()),
+        ("IQR on raw area_ha", float(raw_fence), fires_checked.filter(F.col("area_ha") > raw_fence).count()),
+        ("IQR on log10(area_ha)", float(log_fence_ha), fires_checked.filter(F.col("area_ha") > log_fence_ha).count()),
+        ("z-score > 3 on log10(area_ha)", float(z_fence_ha), fires_checked.filter(F.col("area_ha") > z_fence_ha).count()),
     ],
     "method STRING, upper_fence_ha DOUBLE, outliers LONG",
 )
 display(comparison)
 
-display(fires_checked.orderBy(F.desc("sup_ha")).limit(10))
+
 
 # COMMAND ----------
 
 # MAGIC %md
 # MAGIC **Decision:** large fires are real events (e.g. the 2023 season), and they are exactly what the project is about, so they are **kept**.
-# MAGIC They are flagged with `sup_ha_outlier` (log-IQR method) so later steps can choose to cap or exclude them.
+# MAGIC They are flagged with `area_ha_outlier` using a **domain threshold of 200 ha** — the standard Canadian fire-management definition of a "large fire"
+# MAGIC ([CIFFC convention](https://cwfis.cfs.nrcan.gc.ca/downloads/nfdb/fire_pnt/current_version/NFDB_point_shapefile_metadata.pdf)). This is easier to justify in a report than a statistical fence and is stable across data updates.
+# MAGIC The IQR analysis above serves as supporting evidence: the log-IQR fence (358 ha) and z-score fence (10,031 ha) bracket the 200 ha threshold,
+# MAGIC confirming that the domain cutoff sits in a defensible range.
 
 # COMMAND ----------
 
-fires_checked = fires_checked.withColumn("sup_ha_outlier", F.col("sup_ha") > F.lit(log_fence_ha))
-log("fires", "outlier (IQR on log10)", "sup_ha",
-    fires_checked.filter("sup_ha_outlier").count(), f"flagged and kept (fence {log_fence_ha:,.0f} ha)")
+LARGE_FIRE_THRESHOLD_HA = 200  # CIFFC convention: fires >= 200 ha are "large fires"
+
+fires_checked = fires_checked.withColumn("area_ha_outlier", F.col("area_ha") > F.lit(LARGE_FIRE_THRESHOLD_HA))
+log("fires", "outlier (domain threshold)", "area_ha",
+    fires_checked.filter("area_ha_outlier").count(), f"flagged and kept (at the threshold of {LARGE_FIRE_THRESHOLD_HA} ha)")
 
 # COMMAND ----------
 
 # MAGIC %md
 # MAGIC ### Duplicates
-# MAGIC `cle` is unique, so there are no exact duplicates. Near-duplicates — different fire numbers with the same start date and the
-# MAGIC exact same coordinates — may be one fire reported twice. They are flagged, not removed, because each has its own official fire number.
+# MAGIC `fire_id` is unique, so there are no exact duplicates. Near-duplicates — different fire numbers with the same start date and
+# MAGIC the exact same coordinates — may be one fire reported twice.
+# MAGIC
+# MAGIC **What we found:** 10 pairs of near-duplicate fires (20 rows total). Each pair shares the same `start_date`, `latitude`, and
+# MAGIC `longitude` but has a different `area_ha`. In most pairs the larger fire has a non-zero area while its partner reports 0 ha
+# MAGIC (e.g. fire `20071080504` at 549.9 ha paired with `20071080507` at 0 ha). Keeping both would give an ML model two different
+# MAGIC target values (area) for the same input features (date + location), effectively double-counting the event.
+# MAGIC
+# MAGIC **How we proceed:** within each near-duplicate group, the record with the **larger `area_ha`** is kept and the rest are removed.
+# MAGIC The display below shows both rows of every pair side by side (the `_dup_rank` column marks 1 = kept, 2 = removed).
+# MAGIC This removes 10 rows (15,078 → 15,068), a 0.07% reduction with no information loss since each kept row covers the same
+# MAGIC fire event at the same location and date.
 
 # COMMAND ----------
 
-assert fires_checked.select("cle").distinct().count() == fires_checked.count(), "cle is not unique"
+assert fires_checked.select("fire_id").distinct().count() == fires_checked.count(), "fire_id is not unique"
 
-w_dup = Window.partitionBy("date_debut", "latitude", "longitude")
-fires_checked = fires_checked.withColumn("possible_duplicate", F.count("*").over(w_dup) > 1)
+# Near-duplicates: same start date and coordinates, different fire_id
+w_rank = Window.partitionBy("start_date", "latitude", "longitude").orderBy(F.desc("area_ha"), "fire_id")
+w_count = Window.partitionBy("start_date", "latitude", "longitude")
+fires_checked = fires_checked.withColumn("_dup_rank", F.row_number().over(w_rank))
 
-display(fires_checked.filter("possible_duplicate").orderBy("date_debut", "latitude", "cle"))
-log("fires", "near-duplicate check", "date_debut, latitude, longitude",
-    fires_checked.filter("possible_duplicate").count(), "flagged possible_duplicate, kept")
+# Show ALL rows in duplicate groups (both kept and removed), side by side
+display(
+    fires_checked.withColumn("_dup_count", F.count("*").over(w_count))
+    .filter("_dup_count > 1")
+    .orderBy("start_date", "latitude", "_dup_rank")
+    .drop("_dup_count")
+)
+
+n_before = fires_checked.count()
+fires_checked = fires_checked.filter("_dup_rank == 1").drop("_dup_rank")
+n_after = fires_checked.count()
+log("fires", "near-duplicate removal", "start_date, latitude, longitude",
+    n_before - n_after, f"removed smaller-area duplicates, kept larger-area record ({n_after:,} rows remaining)")
 
 silver_fires = fires_checked
 
@@ -696,7 +762,7 @@ def write_table(df, name, pk_cols, comment):
     spark.sql(f"ALTER TABLE {name} ADD CONSTRAINT {pk_name} PRIMARY KEY ({', '.join(pk_cols)})")
     print(f"{name}: {spark.table(name).count():,} rows")
 
-write_table(silver_fires, T_FIRES, ["cle"], "SOPFEU wildfire origin points 2000-2024, typed and checked")
+write_table(silver_fires, T_FIRES, ["fire_id"], "SOPFEU wildfire origin points 2000-2024, typed and checked")
 write_table(silver_stations, T_STATIONS, ["climate_id"], "ECCC weather stations (one row per station)")
 write_table(silver_weather, T_WEATHER, ["climate_id", "date"], "ECCC daily weather 2000-2025, typed, outliers flagged, nulls handled")
 
