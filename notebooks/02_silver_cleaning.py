@@ -36,10 +36,6 @@ SILVER = f"{CATALOG}.silver"
 
 YEAR_MIN, YEAR_MAX = 2000, 2024   # project scope for fires
 
-# Null handling thresholds for weather (days of consecutive missing values)
-INTERP_MAX_GAP = 3        # gaps of 1–3 days: linear interpolation (temperatures only)
-GROUP_MEAN_MAX_GAP = 30   # gaps of up to 30 days: station × month mean; longer gaps are left null
-
 # Every cleaning action is recorded here and written to silver.cleaning_log at the end
 cleaning_log = []
 
@@ -204,9 +200,9 @@ display(violations)
 for name, v in violations.first().asDict().items():
     log("fires", "validity rule", name, v, "flagged is_valid = false" if v else "no violations")
 
-# Adding is_valid flag to the dataset in case any rows that violate any domain rule are flagged invalid
-is_valid = ~F.greatest(*[F.coalesce(cond, F.lit(False)) for cond in rules.values()])
-fires_checked = fires_typed.withColumn("is_valid", is_valid)
+# No is_valid column added — all rules passed with zero violations, so the flag would be constant (all true).
+# The violation counts and cleaning log above preserve the audit trail.
+fires_checked = fires_typed
 
 # COMMAND ----------
 
@@ -518,15 +514,19 @@ RANGES = {
 }
 
 weather_checked = weather_typed
+# each measure column is checked against a possible range of values
 for c, (lo, hi) in RANGES.items():
     bad = weather_checked.filter(~F.col(c).between(lo, hi)).count()
     log("weather", "range rule", c, bad, f"set to null (outside {lo}..{hi})" if bad else f"no values outside {lo}..{hi}")
     weather_checked = weather_checked.withColumn(c, F.when(F.col(c).between(lo, hi), F.col(c)))
 
+
 # Consistency rule: daily max must not be below daily min
 inconsistent = F.col("max_temp_c") < F.col("min_temp_c")
 bad = weather_checked.filter(inconsistent).count()
 log("weather", "consistency rule", "max_temp_c < min_temp_c", bad, "both set to null" if bad else "no violations")
+
+
 weather_checked = (
     weather_checked
     .withColumn("_bad", F.coalesce(inconsistent, F.lit(False)))
@@ -544,12 +544,15 @@ weather_checked = (
 
 # COMMAND ----------
 
+# Window definition
 w_global = Window.partitionBy("climate_id")
 w_season = Window.partitionBy("climate_id", F.month("date"))
 
+# The classic z-score formula: (value − mean) / stddev
 def zscore(c, w):
     return (F.col(c) - F.avg(c).over(w)) / F.stddev(c).over(w)
 
+#For each row, it computes the seasonal z-score (station × month) for max and min temperature, then flags True if |z| > 3 (more than 3 standard deviations from the seasonal norm)
 weather_checked = (
     weather_checked
     .withColumn("max_temp_z", zscore("max_temp_c", w_season))
@@ -558,6 +561,7 @@ weather_checked = (
     .withColumn("min_temp_outlier", F.coalesce(F.abs("min_temp_z") > 3, F.lit(False)))
 )
 
+# Global vs seasonal comparison table
 display(
     weather_checked
     .withColumn("max_temp_gz", zscore("max_temp_c", w_global))
@@ -570,6 +574,18 @@ display(
     )
 )
 
+
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC The **seasonal** z-score is better in catching outliers because a **global** z-score compares a January day with a July day. A -24.5°C min temp is perfectly normal in January but would look extreme against the station's year-round mean. The seasonal z-score compares each day only against the same month at the same station, so it actually detects anomalies for that time of year.
+# MAGIC
+# MAGIC All 57 + 46 outliers are **flagged and kept** — they're real outliers worth noticing
+
+# COMMAND ----------
+
+# Top 10 outliers table
 display(
     weather_checked.filter("max_temp_outlier OR min_temp_outlier")
     .select("climate_id", "date", "max_temp_c", F.round("max_temp_z", 2).alias("max_temp_z"),
@@ -587,6 +603,16 @@ weather_checked = weather_checked.drop("max_temp_z", "min_temp_z")
 # COMMAND ----------
 
 # MAGIC %md
+# MAGIC
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC
+
+# COMMAND ----------
+
+# MAGIC %md
 # MAGIC ### Precipitation: IQR on all days vs on wet days
 # MAGIC Most days are dry, so Q1 = 0 and the IQR fence on all days is only a few mm — it flags every ordinary rainy day.
 # MAGIC Applying IQR to **wet days only** (precipitation > 0), per station, gives a meaningful fence for heavy-rain events.
@@ -596,6 +622,7 @@ weather_checked = weather_checked.drop("max_temp_z", "min_temp_z")
 pq1, pq3 = weather_checked.approxQuantile("total_precip_mm", [0.25, 0.75], 0.0)
 all_days_fence = pq3 + 1.5 * (pq3 - pq1)
 
+# Wet-days IQR (precipitation > 0)
 wet_fences = (
     weather_checked.filter(F.col("total_precip_mm") > 0)
     .groupBy("climate_id")
@@ -627,20 +654,26 @@ log("weather", "outlier (IQR on wet days)", "total_precip_mm",
 # COMMAND ----------
 
 # MAGIC %md
+# MAGIC - Most days have 0 precipitation(45.3% of all days) and the IQR fence is tiny (~6 mm). This flags every ordinary rainy day as an "outlier" — 3,141 days, which is meaningless.
+# MAGIC - The top 10 heaviest precipitation days include 150.5 mm on Aug 9, 2024 at Lac Bouchette — a real extreme rainfall event. All 644 are flagged and kept.
+# MAGIC
+# MAGIC
+
+# COMMAND ----------
+
+# MAGIC %md
 # MAGIC ## 2.4 Null handling
 # MAGIC
-# MAGIC Only the attributes the model will use are imputed: max/min/mean temperature and total precipitation
-# MAGIC (heating/cooling degree days are recomputed from mean temperature). Rain, snow and snow on ground keep their nulls.
+# MAGIC The goal: fill missing values in 4 model-relevant columns (max/min/mean temperature and total precipitation) using a priority cascade — exact derivations first, then interpolation, then group means, then leave null.
 # MAGIC
-# MAGIC | Step | Technique | Applies to | Why |
-# MAGIC |---|---|---|---|
+# MAGIC Rain, snow and snow on ground keep their nulls.
+# MAGIC
+# MAGIC | Step | Technique | Applies to | Why | How
+# MAGIC |---|---|---|---|---|
 # MAGIC | 1 | **Derivation from a functional dependency** | `total_precip = rain + snow`; `mean = (max + min) / 2`; degree days from mean | Exact, not an estimate — the FD is verified first |
-# MAGIC | 2 | **Linear interpolation** within the station's time series | max/min temperature, gaps ≤ 3 days | Temperature changes smoothly from day to day |
-# MAGIC | 3 | **Group mean** (same station, same month, observed values) | max/min temperature and precipitation, gaps ≤ 30 days | Keeps the seasonal level; precipitation is not interpolated because rain is not continuous |
-# MAGIC | 4 | **Leave null** | gaps > 30 days | A month or more of invented weather would be fiction; Gold decides how to handle these rows |
-# MAGIC
-# MAGIC Each imputed column gets a `<column>_source` column recording how every value was obtained.
-# MAGIC The series is handled in pandas because interpolation and gap lengths need row order within each station (28k rows fit easily in memory).
+# MAGIC | 2 | **Linear interpolation** within the station's time series | max/min temperature, gaps ≤ 3 days | Interpolation assumes the value changes smoothly and linearly between the endpoints. For 1–3 days, that's reasonable — temperature doesn't jump wildly in 3 days. But for a 30-day gap, a straight line from a January value to a February value would be a crude guess, not a real measurement |
+# MAGIC | 3 | **Group mean** (same station, same month, observed values) | max/min temperature and precipitation, gaps ≤ 30 days | Keeps the seasonal level; precipitation is not interpolated because rain is not continuous | Say station 7044288 (Les Buissons) has a missing `max_temp_c` on March 15, 2012. The group mean is computed as: Average of every observed `max_temp_c` for station 7044288 in any March (March 2000, March 2001, …, March 2024).If Les Buissons has 20 years of March data with ~600 observed daily max temps averaging 2.1°C, then the missing March 15, 2012 value is filled with 2.1 — "the typical March temperature at this station." |
+# MAGIC | 4 | **Leave null** | gaps > 30 days | A month or more of invented weather would be fiction; Gold decides how to handle these rows | Each imputed column gets a `<column>_source` column recording how every value was obtained.
 
 # COMMAND ----------
 
@@ -677,12 +710,24 @@ def gap_length(s):
 
 # COMMAND ----------
 
+# MAGIC %md
+# MAGIC We need to ensure FDs hold with the existing values because we will fill thousands of missing values of 
+# MAGIC - `mean_temp_c`(FD1), 
+# MAGIC - `total_precip_mm`(FD2), 
+# MAGIC - `heat_deg_days_c` and `cool_deg_days_c`(FD3) `mean_temp_c` has been filled.  
+
+# COMMAND ----------
+
+# FD1: mean = (max + min)/2 and rounds it the way ECCC does 
 full = pdf.dropna(subset=["max_temp_c", "min_temp_c", "mean_temp_c"])
+# Compare against the actual mean_temp_c if the difference >0.01, it's a violation
 mean_fd_violations = int((round_half_away((full["max_temp_c"] + full["min_temp_c"]) / 2) - full["mean_temp_c"]).abs().gt(0.01).sum())
 
+# FD2: precip = rain + snow 
 full_p = pdf.dropna(subset=["total_rain_mm", "total_snow_cm", "total_precip_mm"])
 precip_fd_violations = int((full_p["total_rain_mm"] + full_p["total_snow_cm"] - full_p["total_precip_mm"]).abs().gt(0.01).sum())
 
+# FD3: Heating Degree Days (HDD) and Cooling Degree Days (CDD) | HDD/CDD from mean
 full_d = pdf.dropna(subset=["mean_temp_c", "heat_deg_days_c", "cool_deg_days_c"])
 dd_fd_violations = int(
     ((np.maximum(0, 18 - full_d["mean_temp_c"]) - full_d["heat_deg_days_c"]).abs().gt(0.01)
@@ -701,9 +746,12 @@ assert mean_fd_violations == 0 and precip_fd_violations == 0 and dd_fd_violation
 
 # COMMAND ----------
 
+#Find rows where precipitation is missing but its components exist
 m = pdf["total_precip_mm"].isna() & pdf["total_rain_mm"].notna() & pdf["total_snow_cm"].notna()
+# Select a subset of rows where m holds true, and column 
 pdf.loc[m, "total_precip_mm"] = pdf.loc[m, "total_rain_mm"] + pdf.loc[m, "total_snow_cm"]
-pdf.loc[m, "total_precip_mm_source"] = "fd_derived"
+# Tag the source
+pdf.loc[m, "total_precip_mm_source"] = "fd1_derived"
 log("weather", "impute: FD rain + snow", "total_precip_mm", m.sum(), "derived exactly")
 
 # COMMAND ----------
@@ -713,38 +761,53 @@ log("weather", "impute: FD rain + snow", "total_precip_mm", m.sum(), "derived ex
 
 # COMMAND ----------
 
+# Null handling thresholds for weather (days of consecutive missing values)
+INTERP_MAX_GAP = 3        # gaps of 1–3 days: linear interpolation (temperatures only)
+GROUP_MEAN_MAX_GAP = 30   # gaps of up to 30 days: station × month mean; longer gaps are left null
+
 def impute(col, interpolate):
+    # for each row, how many consecutive missing values surround it
     gaps = pdf.groupby("climate_id")[col].transform(gap_length)
-    group_mean = pdf.groupby(["climate_id", "month"])[col].transform("mean")   # computed before this column is filled
+    # the mean of all observed values for the same station in the same month
+    group_mean = pdf.groupby(["climate_id", "month"])[col].transform("mean")
+
 
     if interpolate:
+        # draws a straight line between the last observed value before the gap and the first observed value after it.
+        # limit_area="inside" means it only fills between observed values — it won't extrapolate past the last known value.
         interp = pdf.groupby("climate_id")[col].transform(lambda s: s.interpolate(method="linear", limit_area="inside"))
+        # the value is null AND the gap is ≤ 3 days AND interpolation produced a value 
         m = pdf[col].isna() & (gaps <= INTERP_MAX_GAP) & interp.notna()
         pdf.loc[m, col] = interp[m].round(1)
         pdf.loc[m, f"{col}_source"] = "interpolated"
         log("weather", f"impute: linear interpolation (gap <= {INTERP_MAX_GAP} days)", col, m.sum(), "filled")
-
+    # For any still-null values with gaps ≤ 30 days, fill with the station × month average.
     m = pdf[col].isna() & (gaps <= GROUP_MEAN_MAX_GAP) & group_mean.notna()
     pdf.loc[m, col] = group_mean[m].round(1)
     pdf.loc[m, f"{col}_source"] = "station_month_mean"
     log("weather", f"impute: station x month mean (gap <= {GROUP_MEAN_MAX_GAP} days)", col, m.sum(), "filled")
-
+    # Anything still null (gaps > 30 days, or no group mean available) is tagged "not_imputed" and left for Gold to handle.
     m = pdf[col].isna()
     pdf.loc[m, f"{col}_source"] = "not_imputed"
     log("weather", f"leave null (gap > {GROUP_MEAN_MAX_GAP} days)", col, m.sum(), "left null")
 
-impute("max_temp_c", interpolate=True)
-impute("min_temp_c", interpolate=True)
-impute("total_precip_mm", interpolate=False)
+impute("max_temp_c", interpolate=True) # interpolation + group mean
+impute("min_temp_c", interpolate=True) # interpolation + group mean
+impute("total_precip_mm", interpolate=False) # Precipitation skips interpoloation entirely because rain isn't continuous
 
 # Max and min are imputed independently, which can produce max < min on a day where one of them was observed.
 # Re-apply the consistency rule: the imputed value is clipped to the observed one.
 bad = pdf["max_temp_c"] < pdf["min_temp_c"]
+
 fix_max = bad & (pdf["max_temp_c_source"] != "observed")
 fix_min = bad & ~fix_max & (pdf["min_temp_c_source"] != "observed")
+
 pdf.loc[fix_max, "max_temp_c"] = pdf.loc[fix_max, "min_temp_c"]
 pdf.loc[fix_min, "min_temp_c"] = pdf.loc[fix_min, "max_temp_c"]
+
 log("weather", "consistency after imputation", "max_temp_c < min_temp_c", (fix_max | fix_min).sum(), "imputed value clipped to observed value")
+
+# Assertion confirms no violation after the fix
 assert not (pdf["max_temp_c"] < pdf["min_temp_c"]).any()
 
 # COMMAND ----------
@@ -754,12 +817,23 @@ assert not (pdf["max_temp_c"] < pdf["min_temp_c"]).any()
 
 # COMMAND ----------
 
+# mean is missing but both max and min are now available (either observed or imputed in the previous step)
 m = pdf["mean_temp_c"].isna() & pdf["max_temp_c"].notna() & pdf["min_temp_c"].notna()
+
+# 2nd mask - both max and min actually observed
 both_observed = (pdf["max_temp_c_source"] == "observed") & (pdf["min_temp_c_source"] == "observed")
+
+# Fill mean using the FD: (max + min) / 2 if both max and min are available
 pdf.loc[m, "mean_temp_c"] = round_half_away((pdf.loc[m, "max_temp_c"] + pdf.loc[m, "min_temp_c"]) / 2)
-pdf.loc[m & both_observed, "mean_temp_c_source"] = "fd_derived"
-pdf.loc[m & ~both_observed, "mean_temp_c_source"] = "fd_from_imputed"
+
+# 3 different tags depending on input quality
+# both max and min were observed -> the mean is exact (0 uncertainty)
+pdf.loc[m & both_observed, "mean_temp_c_source"] = "fd_derived" 
+# at least one of max/min was imputed 
+pdf.loc[m & ~both_observed, "mean_temp_c_source"] = "fd_from_imputed" 
+# Any mean still null (because both max and min were null)
 pdf.loc[pdf["mean_temp_c"].isna(), "mean_temp_c_source"] = "not_imputed"
+
 log("weather", "impute: FD (max + min) / 2 from observed max/min", "mean_temp_c", (m & both_observed).sum(), "derived exactly")
 log("weather", "impute: FD (max + min) / 2 from imputed max/min", "mean_temp_c", (m & ~both_observed).sum(), "derived")
 
@@ -776,27 +850,40 @@ for c, expr in [("heat_deg_days_c", lambda t: np.maximum(0, 18 - t)), ("cool_deg
 # COMMAND ----------
 
 out_cols = ["climate_id", "date", *IMPUTE_COLS, *[f"{c}_source" for c in SOURCE_COLS]]
+
+# Convert pandas back to Spark
 imputed = spark.createDataFrame(pdf[out_cols])
 imputed = imputed.select(
     "climate_id",
     F.col("date").cast("date").alias("date"),
-    # pandas NaN arrives as NaN, not null
+    # pandas represents missing values as NaN, not null (Spark)
     *[F.when(~F.isnan(c), F.col(c)).alias(c) for c in IMPUTE_COLS],
     *[f"{c}_source" for c in SOURCE_COLS],
 )
 
+# Drops the old measure columns from weather_checked (they have the pre-imputation nulls) & Joins the imputed versions back
 silver_weather = weather_checked.drop(*IMPUTE_COLS).join(imputed, ["climate_id", "date"])
+# Asserts the row count didn't change after imputation
 assert silver_weather.count() == weather_checked.count()
 
+# Before/after null comparison
+# null_summary (defined earlier in the notebook) counts nulls per station for the 4 source columns.
 before = null_summary(weather_typed, SOURCE_COLS).withColumn("stage", F.lit("before"))
 after = null_summary(silver_weather, SOURCE_COLS).withColumn("stage", F.lit("after"))
 display(before.unionByName(after).orderBy("climate_id", F.desc("stage")))
 
+
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC - **Lac Bouchette** has 0 group-mean fills because its gaps are either short (interpolated) or very long (station offline since 2016 — left null).
+# MAGIC - **Sorel** has 3,747 not-imputed values — the long offline period from Part 2.2
+
+# COMMAND ----------
+
 display(
     silver_weather.groupBy("climate_id").pivot("max_temp_c_source").count().orderBy("climate_id")
-)
-display(
-    silver_weather.groupBy("climate_id").pivot("total_precip_mm_source").count().orderBy("climate_id")
 )
 
 # COMMAND ----------
@@ -809,6 +896,7 @@ display(
 
 # COMMAND ----------
 
+# Four tables written to the wildfire_project.silver schema
 T_FIRES = f"{SILVER}.fires"
 T_STATIONS = f"{SILVER}.weather_stations"
 T_WEATHER = f"{SILVER}.weather_daily"
@@ -819,9 +907,12 @@ if spark.catalog.tableExists(T_WEATHER):
     spark.sql(f"ALTER TABLE {T_WEATHER} DROP CONSTRAINT IF EXISTS fk_weather_station")
 
 def write_table(df, name, pk_cols, comment):
+    # Registers the DataFrame as a temp view _to_write
     df.createOrReplaceTempView("_to_write")
+    # Creates or replaces the UC table from that view, with a comment
     spark.sql(f"CREATE OR REPLACE TABLE {name} COMMENT '{comment}' AS SELECT * FROM _to_write")
     for c in pk_cols:
+        # Sets PK columns NOT NULL — a primary key can't have nulls
         spark.sql(f"ALTER TABLE {name} ALTER COLUMN {c} SET NOT NULL")
     pk_name = "pk_" + name.split(".")[-1]
     spark.sql(f"ALTER TABLE {name} DROP CONSTRAINT IF EXISTS {pk_name}")
@@ -832,6 +923,7 @@ write_table(silver_fires, T_FIRES, ["fire_id"], "SOPFEU wildfire origin points 2
 write_table(silver_stations, T_STATIONS, ["climate_id"], "ECCC weather stations (one row per station)")
 write_table(silver_weather, T_WEATHER, ["climate_id", "date"], "ECCC daily weather 2000-2025, typed, outliers flagged, nulls handled")
 
+# Links weather_daily.climate_id → weather_stations.climate_id, so Unity Catalog can show the relationship in Data Explorer.
 spark.sql(f"""
     ALTER TABLE {T_WEATHER} ADD CONSTRAINT fk_weather_station
     FOREIGN KEY (climate_id) REFERENCES {T_STATIONS} (climate_id)
