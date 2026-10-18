@@ -11,6 +11,7 @@ Platform: Databricks Free Edition (Unity Catalog, Delta Lake, MLflow, Jobs) + Po
 | `notebooks/00_setup.sql` | Creates the catalog, schemas and `raw_files` volume (re-runnable) |
 | `notebooks/01_bronze_ingestion.py` | Raw zips in the volume → `wildfire_project.bronze.*` Delta tables |
 | `notebooks/02_silver_cleaning.py` | Bronze → cleaned `wildfire_project.silver.*` tables |
+| `notebooks/03_gold_features.py` | Silver → fire–weather integration and model feature tables in `wildfire_project.gold.*` |
 | `scripts/download_weather.py` | Downloads the ECCC weather CSVs and builds `weather_2000_2025.zip` (run locally) |
 
 Notebooks are stored in Databricks source format (`.py`) so they diff cleanly in git and open as notebooks in Databricks Git folders.
