@@ -808,7 +808,7 @@ m = (pdf["total_precip_mm"].isna() & pdf["total_rain_mm"].notna() & pdf["total_s
 # Select a subset of rows where m holds true, and column 
 pdf.loc[m, "total_precip_mm"] = pdf.loc[m, "total_rain_mm"] + pdf.loc[m, "total_snow_cm"]
 # Tag the source
-pdf.loc[m, "total_precip_mm_source"] = "fd1_derived"
+pdf.loc[m, "total_precip_mm_source"] = "fd2_derived"
 log("weather", "impute: FD rain + snow", "total_precip_mm", m.sum(), "derived exactly")
 
 # COMMAND ----------
