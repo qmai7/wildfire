@@ -118,7 +118,9 @@ weather_raw = (
     .option("header", "true")
     .option("inferSchema", "false")   # keep everything as string in Bronze
     .option("encoding", "UTF-8")
-    .csv(f"{EXTRACT_DIR}/weather/**/*.csv")
+    .option("recursiveFileLookup", "true")   # find the CSVs whatever the folder layout inside the zip
+    .option("pathGlobFilter", "*.csv")
+    .csv(f"{EXTRACT_DIR}/weather")
     .select("*", F.col("_metadata.file_path").alias("_source_file"))
 )
 
