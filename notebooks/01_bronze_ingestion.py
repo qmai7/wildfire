@@ -11,7 +11,7 @@
 # MAGIC | Source | Raw file | Bronze table |
 # MAGIC |---|---|---|
 # MAGIC | SOPFEU wildfire origin points (Shapefile, 1972–2024) | `Feux_pt_ori_SHP.zip` | `wildfire_project.bronze.fires_raw` |
-# MAGIC | ECCC daily weather, 3 stations × 2000–2025 (CSV) | `weather_2000_2025.zip` | `wildfire_project.bronze.weather_daily_raw` |
+# MAGIC | ECCC daily weather, 30 stations × 2000–2025 (CSV, built by `scripts/download_weather.py`) | `weather_2000_2025.zip` | `wildfire_project.bronze.weather_daily_raw` |
 # MAGIC
 # MAGIC Bronze rules followed here:
 # MAGIC - All values stored as **strings**, exactly as in the source (type casting happens in Silver).
@@ -51,13 +51,15 @@ WEATHER_TABLE = f"{CATALOG}.bronze.weather_daily_raw"
 # MAGIC ## 1. Unzip raw files into the volume
 # MAGIC
 # MAGIC `zipfile.extractall` cannot write directly to a volume on serverless, so each zip is read as bytes with Spark
-# MAGIC and every member is uploaded through the Databricks SDK Files API.
+# MAGIC and every member is uploaded through the Databricks SDK Files API. Each target folder is emptied first.
 
 # COMMAND ----------
 
 w = WorkspaceClient()
 
 for zip_path, target in [(FIRES_ZIP, f"{EXTRACT_DIR}/fires"), (WEATHER_ZIP, f"{EXTRACT_DIR}/weather")]:
+    # Start from an empty folder, so files from an older version of the zip are not read again
+    dbutils.fs.rm(target, recurse=True)
     zip_bytes = spark.read.format("binaryFile").load(zip_path).select("content").first()["content"]
     with zipfile.ZipFile(io.BytesIO(zip_bytes)) as z:
         for info in z.infolist():
@@ -101,7 +103,7 @@ display(spark.table(FIRES_TABLE).limit(5))
 # MAGIC %md
 # MAGIC ## 3. Daily weather → `bronze.weather_daily_raw`
 # MAGIC
-# MAGIC 78 CSV files (one per station per year) are read in one pass. `_metadata.file_path` records which file each row came from.
+# MAGIC 780 CSV files (one per station per year) are read in one pass. `_metadata.file_path` records which file each row came from.
 
 # COMMAND ----------
 
@@ -133,7 +135,7 @@ display(spark.table(WEATHER_TABLE).limit(5))
 # MAGIC %md
 # MAGIC ## 4. Validation
 # MAGIC
-# MAGIC Expected: **44,471** fire records (1972–2024, unfiltered), **78** weather files, **9,497** days per station (2000-01-01 → 2025-12-31).
+# MAGIC Expected: **44,471** fire records (1972–2024, unfiltered), **780** weather files (30 stations × 26 years), **9,497** days per station (2000-01-01 → 2025-12-31).
 
 # COMMAND ----------
 
@@ -153,4 +155,5 @@ display(
 )
 
 assert fires_count == 44471, f"Unexpected fire row count: {fires_count}"
-assert spark.table(WEATHER_TABLE).select("_source_file").distinct().count() == 78, "Expected 78 weather files"
+assert spark.table(WEATHER_TABLE).select("_source_file").distinct().count() == 780, "Expected 780 weather files"
+assert spark.table(WEATHER_TABLE).count() == 30 * 9497, "Expected 9,497 days for each of the 30 stations"

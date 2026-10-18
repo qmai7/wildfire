@@ -18,24 +18,23 @@ This project integrates **two independently sourced datasets**, which is a core 
 
 **1. Wildfire origin points — SOPFEU / Ministère des Ressources naturelles et des Forêts (Données Québec, CC-BY).** Point-level records of every wildfire in Quebec since 1972, including start/report/extinction dates, cause (Humaine / Foudre), burned area (hectares), and precise coordinates. Scoped to **2000–2024** for this project, giving **15,078 fire records** — enough volume for robust time-series and spatial modeling while keeping scope manageable.
 
-**2. Historical daily weather — Environment and Climate Change Canada.** Daily temperature (max/min/mean) and precipitation data from three representative weather stations, selected to cover the three regions where fire activity is most concentrated in the filtered dataset:
-- **Sorel** (southern Quebec — Montérégie/Mauricie fire-dense band)
-- **Lac Bouchette** (Saguenay–Lac-Saint-Jean / Abitibi boreal region)
-- **Les Buissons** (Côte-Nord)
+**2. Historical daily weather — Environment and Climate Change Canada.** Daily temperature (max/min/mean) and precipitation data from **30 weather stations**, 2000–2025. A first version used 3 stations, but the median fire was 185 km from the nearest one, too far for rainfall to be representative (daily summer rain is only weakly related between stations more than about 50 km apart). The 30 stations were selected from ECCC's Station Inventory for complete fire-season data and for proximity to past fires. With them, the median fire is **49 km** from its nearest station (45 km in the Intensive zone). Selection method and station list: [docs/phase1/B_dataset_summary.md](docs/phase1/B_dataset_summary.md).
+
+**Scope: Intensive protection zone only.** SOPFEU divides Québec into an Intensive zone in the south and a Nordic zone in the north. We do not have enough weather data to model fires in the Nordic zone: even with 30 stations, its 1,413 fires (2000–2024) are a median **399 km** from the nearest station, and no long-running station with complete data exists there. Both models therefore cover the **Intensive zone only (13,665 fires, 2000–2024)**. Nordic-zone fires stay in the cleaned data and can be shown on the dashboard as historical records, but they are not used for modeling or forecasting.
 
 ## 3. Objectives
 
 1. Build a governed, layered data pipeline (Bronze → Silver → Gold) that ingests and integrates fire and weather data from two independent sources into a model-ready feature set.
-2. Train a model that forecasts wildfire **hotspot risk** across a spatial grid and time-bin structure covering Quebec's fire-active regions.
+2. Train a model that forecasts wildfire **hotspot risk** across a spatial grid and time-bin structure covering Quebec's Intensive protection zone.
 3. Train a second model that predicts the most likely **cause** (human vs. lightning) conditional on a location/time being flagged as a hotspot.
 4. Operationalize both models through **scheduled batch scoring**, rather than a live endpoint, to demonstrate a realistic, low-maintenance MLOps pattern appropriate for this project's scope.
 5. Deliver results through an interactive **Power BI dashboard** for exploration and presentation.
 
 ## 4. Methodology
 
-**Data Integration.** This is a central challenge of the project, addressed through two distinct join operations: a **spatial join**, assigning each fire record to its nearest weather station using haversine distance (validated on a 113-record test subset with a 100% match rate); and a **temporal join**, merging each fire's start date against that station's daily weather record. The fire data (Shapefile) and weather data (CSV, one file per station per year) come from entirely different agencies, formats, and schemas, requiring genuine reconciliation rather than a trivial key match.
+**Data Integration.** This is a central challenge of the project, addressed through two distinct join operations: a **spatial join**, assigning each fire record to its nearest of the 30 weather stations using haversine distance; and a **temporal join**, merging each fire's start date against that station's daily weather record. The fire data (Shapefile) and weather data (CSV, one file per station per year) come from entirely different agencies, formats, and schemas, requiring genuine reconciliation rather than a trivial key match.
 
-**Data Cleaning and Transformation.** The Silver layer standardizes both sources: parsing and validating fire dates and coordinates, normalizing weather column names/units, and handling missing values in optional weather fields (e.g., wind gust data, which is sparsely populated).
+**Data Cleaning and Transformation.** The Silver layer standardizes both sources: parsing and validating fire dates and coordinates, normalizing weather column names/units, flagging outliers, and handling missing values in the weather measures (derivation from exact relationships, interpolation, or station-month means, with every filled value tagged by how it was obtained). Wind gust is recorded at some stations only and is kept without imputation.
 
 **Feature Engineering.** The Gold layer aggregates integrated fire-weather records into a spatial grid × time-bin structure (e.g., region and month/week). For each grid-cell/time-bin, historical fire counts, weather conditions (temperature, precipitation) from the nearest station, day-of-year/season, and cause mix are computed, producing the feature table used for modeling.
 

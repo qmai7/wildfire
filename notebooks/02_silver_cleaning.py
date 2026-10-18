@@ -11,8 +11,8 @@
 # MAGIC | Input (Bronze) | Output (Silver) | Key |
 # MAGIC |---|---|---|
 # MAGIC | `bronze.fires_raw` | `silver.fires` | `fire_id` |
-# MAGIC | `bronze.weather_daily_raw` | `silver.weather_daily` | (`climate_id`, `date`) |
-# MAGIC | `bronze.weather_daily_raw` | `silver.weather_stations` | `climate_id` |
+# MAGIC | `bronze.weather_daily_raw` | `silver.weather_daily` | (`station`, `date`) |
+# MAGIC | `bronze.weather_daily_raw` | `silver.weather_stations` | `station` |
 # MAGIC | — | `silver.cleaning_log` | every cleaning action and how many rows it affected |
 # MAGIC
 # MAGIC Order of operations, for each dataset:
@@ -23,6 +23,8 @@
 # MAGIC 5. **Write** Silver tables with primary/foreign key constraints.
 
 # COMMAND ----------
+
+import re
 
 import numpy as np
 import pandas as pd
@@ -335,7 +337,12 @@ FLAGS = [
     "total_rain_flag", "total_snow_flag", "total_precip_flag", "snow_on_grnd_flag",
 ]
 
-EMPTY_COLS = ["dir_of_max_gust_10s_deg", "spd_of_max_gust_km_h", "dir_of_max_gust_flag", "spd_of_max_gust_flag", "data_quality"]
+EMPTY_COLS = ["data_quality"]
+
+# Wind gust is recorded at some stations only, and is not imputed.
+# ECCC records gust speed only from 31 km/h; a slower gust is stored as the text '<31', which a cast would turn into null.
+GUST_SPEED = "spd_of_max_gust_km_h"
+GUST_FLAGS = ["dir_of_max_gust_flag", "spd_of_max_gust_flag"]
 
 weather_bronze = spark.table(BRONZE_WEATHER)
 
@@ -347,11 +354,44 @@ weather_typed = weather_bronze.select(
     clean_str("longitude_x").try_cast("double").alias("longitude"),
     F.to_date(clean_str("date_time"), "yyyy-MM-dd").alias("date"),
     *[clean_str(c).try_cast("double").alias(c) for c in MEASURES],
-    *[clean_str(c).alias(c) for c in FLAGS]
+    *[clean_str(c).alias(c) for c in FLAGS],
+    clean_str("dir_of_max_gust_10s_deg").try_cast("double").alias("dir_of_max_gust_10s_deg"),
+    clean_str(GUST_SPEED).try_cast("double").alias(GUST_SPEED),
+    F.coalesce(clean_str(GUST_SPEED) == "<31", F.lit(False)).alias("spd_of_max_gust_below_31"),
+    *[clean_str(c).alias(c) for c in GUST_FLAGS],
 )
 
-assert weather_typed.select("climate_id", "date").distinct().count() == weather_typed.count(), "(climate_id, date) is not unique"
-# 3 stations x 9,497 days 
+# Every non-numeric gust speed must be '<31', otherwise a value was silently lost in the cast
+lost = weather_bronze.filter(clean_str(GUST_SPEED).isNotNull() & clean_str(GUST_SPEED).try_cast("double").isNull())
+assert lost.filter(clean_str(GUST_SPEED) != "<31").count() == 0, "unexpected non-numeric gust speed"
+log("weather", "standardize", GUST_SPEED, lost.count(), "'<31' -> speed null, spd_of_max_gust_below_31 = true")
+
+# Readable station key: the ECCC name in title case ('LAC AUX SABLES' -> 'Lac aux Sables'), used instead of climate_id
+LOWER_WORDS = {"DE", "DU", "DES", "LA", "LE", "LES", "AU", "AUX"}   # French particles, lower case unless first
+KEEP_UPPER = {"INRS"}                                               # acronyms
+
+def display_name(eccc_name):
+    """'ST CHARLES DE MANDEVILLE' -> 'St Charles de Mandeville', 'POINTE-AU-PERE (INRS)' -> 'Pointe-au-Pere (INRS)'."""
+    parts = re.split(r"([\s\-/()]+)", eccc_name.strip())   # keep separators so they can be put back
+    out = []
+    for i, p in enumerate(parts):
+        if not p or not p[0].isalnum() or p in KEEP_UPPER:
+            out.append(p)
+        elif p in LOWER_WORDS and i > 0:
+            out.append(p.lower())
+        elif p.startswith("MC") and len(p) > 2:
+            out.append("Mc" + p[2:].capitalize())
+        else:
+            out.append(p.capitalize())
+    return "".join(out)
+
+names = {r.station_name: display_name(r.station_name) for r in weather_typed.select("station_name").distinct().collect()}
+assert len(set(names.values())) == len(names), "two ECCC names map to the same station name"
+station_map = spark.createDataFrame(list(names.items()), "station_name STRING, station STRING")
+weather_typed = weather_typed.join(F.broadcast(station_map), "station_name")
+
+assert weather_typed.select("station", "date").distinct().count() == weather_typed.count(), "(station, date) is not unique"
+# 30 stations x 9,497 days
 print(f"{weather_typed.count():,} station-days")
 
 # COMMAND ----------
@@ -381,8 +421,8 @@ print(f"{weather_typed.count():,} station-days")
 # MAGIC
 # MAGIC This distinction drives the null-handling strategy in 2.4: short gaps with an `M` flag are good
 # MAGIC candidates for linear interpolation, while long gaps with no flag are left null and deferred to Gold.
-# MAGIC For example, station 7063560 has 3,473 missing precipitation days with no flag versus only 353 with `M` —
-# MAGIC indicating the station had long offline periods rather than isolated instrument failures.
+# MAGIC For example, Mont Brun has 549 missing precipitation days with no flag versus 358 with `M` —
+# MAGIC indicating offline periods rather than isolated instrument failures (Table 2).
 
 # COMMAND ----------
 
@@ -403,16 +443,17 @@ for c, v in empty_profile.first().asDict().items():
 
 # MAGIC %md
 # MAGIC ### Table 1: Missing counts per station for every measure column
-# MAGIC Every station has 9,497 days total. Sorel (7063560) is the worst — roughly 40% missing for most columns.
+# MAGIC Every station has 9,497 days total. Les Buissons is the worst (2,188 days without a max temperature, about 23%);
+# MAGIC Quebec/Jean Lesage Intl and Beauceville are the most complete (54 each).
 
 # COMMAND ----------
 
 # for each station, count how many NULLs each measure column has, and also count the total number of days
 def null_summary(df, cols):
     return (
-        df.groupBy("climate_id")
+        df.groupBy("station")
         .agg(*[F.sum(F.col(c).isNull().cast("int")).alias(c) for c in cols], F.count("*").alias("days"))
-        .orderBy("climate_id")
+        .orderBy("station")
     )
 
 display(null_summary(weather_typed, MEASURES))
@@ -429,18 +470,18 @@ display(null_summary(weather_typed, MEASURES))
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC This is the key insight: for Sorel, 3,473 missing precipitation/max_temp days have **no flag** vs only 353/640 with M. That means Sorel wasn't reporting at all for long stretches — it wasn't just instrument failures on active days.
+# MAGIC This is the key insight: stations differ in *why* values are missing. Mont Brun's missing precipitation is mostly **unflagged** (549 vs 358 `M`) — it was not reporting at all for stretches. Les Buissons and St Michel des Saints are the opposite (1,411 and 1,123 `M` vs 304 and 490 unflagged) — the station was active but the gauge reading was not recorded.
 
 # COMMAND ----------
 
 # Missing values with vs without the ECCC 'M' flag
 display(
-    weather_typed.groupBy("climate_id").agg(
+    weather_typed.groupBy("station").agg(
         F.sum((F.col("max_temp_c").isNull() & (F.col("max_temp_flag") == "M")).cast("int")).alias("max_temp_missing_flag_M"),
         F.sum((F.col("max_temp_c").isNull() & F.col("max_temp_flag").isNull()).cast("int")).alias("max_temp_missing_no_flag"),
         F.sum((F.col("total_precip_mm").isNull() & (F.col("total_precip_flag") == "M")).cast("int")).alias("precip_missing_flag_M"),
         F.sum((F.col("total_precip_mm").isNull() & F.col("total_precip_flag").isNull()).cast("int")).alias("precip_missing_no_flag"),
-    ).orderBy("climate_id")
+    ).orderBy("station")
 )
 
 # COMMAND ----------
@@ -453,9 +494,9 @@ display(
 # COMMAND ----------
 
 display(
-    weather_typed.groupBy("station_name", F.year("date").alias("year"))
+    weather_typed.groupBy("station", F.year("date").alias("year"))
     .agg(F.sum(F.col("max_temp_c").isNull().cast("int")).alias("missing_max_temp"))
-    .groupBy("year").pivot("station_name").sum("missing_max_temp")
+    .groupBy("year").pivot("station").sum("missing_max_temp")
     .orderBy("year")
 )
 
@@ -465,38 +506,43 @@ display(
 # MAGIC %md
 # MAGIC ### Key takeaways from the missing-days table
 # MAGIC
-# MAGIC * **Lac Bouchette** — 365 missing days every year from 2016 onward. The station stopped reporting entirely in 2016; all post-2015 data is absent.
-# MAGIC * **Sorel** — gaps concentrated in 2011–2015 (up to 10 days/year). Before and after that window, the station reports reliably.
-# MAGIC * **Les Buissons** — scattered gaps throughout (0–311 days/year), with the worst stretch in 2012–2016. Never a full year offline.
+# MAGIC * **Les Buissons** — the only station with whole years missing inside the fire period: 2013 and 2015 are almost entirely absent (300+ missing days each).
+# MAGIC * **2025** — 9 stations (La Macaza, Lac aux Sables, Lac Berry, Les Buissons, Lingwick, Luskville, Mont Brun, St-Jovite, Wright) have almost no 2025 data yet. Fires stop at 2024, so this does not affect modelling.
+# MAGIC * **All other station-years** — gaps are scattered days or weeks, not whole years. The 30 stations were selected for fire-season completeness (see `docs/phase1/B_dataset_summary.md`).
 # MAGIC
-# MAGIC **Implication for null handling (2.4):** Lac Bouchette's post-2016 gaps are long offline periods (no `M` flag) and will be left null — interpolating a year of invented temperatures would be fiction. The shorter, `M`-flagged gaps at the other stations are candidates for **interpolation** or **group-mean imputation**.
+# MAGIC **Implication for null handling (2.4):** whole missing years are long offline periods and will be left null — interpolating a year of invented temperatures would be fiction. The shorter gaps are candidates for **interpolation** or **group-mean imputation**.
 
 # COMMAND ----------
 
 # MAGIC %md
 # MAGIC ### Station attributes (normalization)
-# MAGIC Station name and coordinates repeat on all ~9,500 rows of each station. They depend only on `climate_id`
-# MAGIC (functional dependency `climate_id → station_name, latitude, longitude`), so they are moved to their own table.
+# MAGIC Climate ID, ECCC name and coordinates repeat on all 9,497 rows of each station. They depend only on `station`
+# MAGIC (functional dependency `station → climate_id, eccc_name, latitude, longitude`), so they are moved to their own table.
+# MAGIC `station` and `climate_id` determine each other (one-to-one), so either could be the key; `station` is used because it is readable.
 
 # COMMAND ----------
 
-fd_check = weather_typed.groupBy("climate_id").agg(
+fd_check = weather_typed.groupBy("station").agg(
+    F.countDistinct("climate_id").alias("climate_ids"),
     F.countDistinct("station_name").alias("names"),
     F.countDistinct("latitude").alias("latitudes"),
     F.countDistinct("longitude").alias("longitudes"),
 )
-# Check functional dependency climate_id -> station_name, lat, long
-assert fd_check.filter("names > 1 OR latitudes > 1 OR longitudes > 1").count() == 0, "climate_id does not determine station attributes"
+# Check functional dependency station -> climate_id, station_name, lat, long
+assert fd_check.filter("climate_ids > 1 OR names > 1 OR latitudes > 1 OR longitudes > 1").count() == 0, "station does not determine station attributes"
+# ... and the reverse, climate_id -> station, so the two are one-to-one
+assert weather_typed.select("climate_id", "station").distinct().count() == weather_typed.select("climate_id").distinct().count()
 
 
-silver_stations = weather_typed.groupBy("climate_id").agg(
-    F.first("station_name").alias("station_name"),
+silver_stations = weather_typed.groupBy("station").agg(
+    F.first("climate_id").alias("climate_id"),
+    F.first("station_name").alias("eccc_name"),
     F.first("latitude").alias("latitude"),
     F.first("longitude").alias("longitude"),
-)
+).orderBy("station")
 display(silver_stations)
 
-weather_typed = weather_typed.drop("station_name", "latitude", "longitude")
+weather_typed = weather_typed.drop("climate_id", "station_name", "latitude", "longitude")
 
 # COMMAND ----------
 
@@ -545,8 +591,8 @@ weather_checked = (
 # COMMAND ----------
 
 # Window definition
-w_global = Window.partitionBy("climate_id")
-w_season = Window.partitionBy("climate_id", F.month("date"))
+w_global = Window.partitionBy("station")
+w_season = Window.partitionBy("station", F.month("date"))
 
 # The classic z-score formula: (value − mean) / stddev
 def zscore(c, w):
@@ -581,14 +627,14 @@ display(
 # MAGIC %md
 # MAGIC The **seasonal** z-score is better in catching outliers because a **global** z-score compares a January day with a July day. A -24.5°C min temp is perfectly normal in January but would look extreme against the station's year-round mean. The seasonal z-score compares each day only against the same month at the same station, so it actually detects anomalies for that time of year.
 # MAGIC
-# MAGIC All 57 + 46 outliers are **flagged and kept** — they're real outliers worth noticing
+# MAGIC All seasonal outliers (counts in the table above) are **flagged and kept** — they're real outliers worth noticing
 
 # COMMAND ----------
 
 # Top 10 outliers table
 display(
     weather_checked.filter("max_temp_outlier OR min_temp_outlier")
-    .select("climate_id", "date", "max_temp_c", F.round("max_temp_z", 2).alias("max_temp_z"),
+    .select("station", "date", "max_temp_c", F.round("max_temp_z", 2).alias("max_temp_z"),
             "min_temp_c", F.round("min_temp_z", 2).alias("min_temp_z"))
     .orderBy(F.desc(F.greatest(F.abs("max_temp_z"), F.abs("min_temp_z"))))
     .limit(10)
@@ -625,14 +671,14 @@ all_days_fence = pq3 + 1.5 * (pq3 - pq1)
 # Wet-days IQR (precipitation > 0)
 wet_fences = (
     weather_checked.filter(F.col("total_precip_mm") > 0)
-    .groupBy("climate_id")
+    .groupBy("station")
     .agg(F.percentile_approx("total_precip_mm", 0.25).alias("q1"), F.percentile_approx("total_precip_mm", 0.75).alias("q3"))
     .withColumn("wet_day_fence_mm", F.col("q3") + 1.5 * (F.col("q3") - F.col("q1")))
 )
 display(wet_fences)
 
 weather_checked = (
-    weather_checked.join(wet_fences.select("climate_id", "wet_day_fence_mm"), "climate_id")
+    weather_checked.join(wet_fences.select("station", "wet_day_fence_mm"), "station")
     .withColumn("precip_outlier", F.coalesce(F.col("total_precip_mm") > F.col("wet_day_fence_mm"), F.lit(False)))
     .drop("wet_day_fence_mm")
 )
@@ -646,7 +692,7 @@ display(
         "method STRING, fence_mm DOUBLE, outliers LONG",
     )
 )
-display(weather_checked.orderBy(F.desc("total_precip_mm")).select("climate_id", "date", "total_precip_mm", "total_precip_flag").limit(10))
+display(weather_checked.orderBy(F.desc("total_precip_mm")).select("station", "date", "total_precip_mm", "total_precip_flag").limit(10))
 
 log("weather", "outlier (IQR on wet days)", "total_precip_mm",
     weather_checked.filter("precip_outlier").count(), "flagged and kept (heavy-rain events are real)")
@@ -654,8 +700,8 @@ log("weather", "outlier (IQR on wet days)", "total_precip_mm",
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC - Most days have 0 precipitation(45.3% of all days) and the IQR fence is tiny (~6 mm). This flags every ordinary rainy day as an "outlier" — 3,141 days, which is meaningless.
-# MAGIC - The top 10 heaviest precipitation days include 150.5 mm on Aug 9, 2024 at Lac Bouchette — a real extreme rainfall event. All 644 are flagged and kept.
+# MAGIC - Most days have 0 precipitation (53.9% of observed days), so the all-days IQR fence is only a few mm. This flags every ordinary rainy day as an "outlier", which is meaningless (see the comparison table).
+# MAGIC - The heaviest day is 214.3 mm at Frelighsburg on 2024-07-01, well above the next ones (141.0 mm at McTavish and La Macaza on 2024-08-09, the remnants of Hurricane Debby). It is inside the 0–300 mm physical range, so it is flagged and kept like the other wet-day outliers, but it is worth checking against nearby stations.
 # MAGIC
 # MAGIC
 
@@ -672,7 +718,7 @@ log("weather", "outlier (IQR on wet days)", "total_precip_mm",
 # MAGIC |---|---|---|---|---|
 # MAGIC | 1 | **Derivation from a functional dependency** | `total_precip = rain + snow`; `mean = (max + min) / 2`; degree days from mean | Exact, not an estimate — the FD is verified first |
 # MAGIC | 2 | **Linear interpolation** within the station's time series | max/min temperature, gaps ≤ 3 days | Interpolation assumes the value changes smoothly and linearly between the endpoints. For 1–3 days, that's reasonable — temperature doesn't jump wildly in 3 days. But for a 30-day gap, a straight line from a January value to a February value would be a crude guess, not a real measurement |
-# MAGIC | 3 | **Group mean** (same station, same month, observed values) | max/min temperature and precipitation, gaps ≤ 30 days | Keeps the seasonal level; precipitation is not interpolated because rain is not continuous | Say station 7044288 (Les Buissons) has a missing `max_temp_c` on March 15, 2012. The group mean is computed as: Average of every observed `max_temp_c` for station 7044288 in any March (March 2000, March 2001, …, March 2024).If Les Buissons has 20 years of March data with ~600 observed daily max temps averaging 2.1°C, then the missing March 15, 2012 value is filled with 2.1 — "the typical March temperature at this station." |
+# MAGIC | 3 | **Group mean** (same station, same month, observed values) | max/min temperature and precipitation, gaps ≤ 30 days | Keeps the seasonal level; precipitation is not interpolated because rain is not continuous | Say Les Buissons has a missing `max_temp_c` on March 15, 2012. The group mean is computed as: Average of every observed `max_temp_c` for Les Buissons in any March (March 2000, March 2001, …, March 2024).If Les Buissons has 20 years of March data with ~600 observed daily max temps averaging 2.1°C, then the missing March 15, 2012 value is filled with 2.1 — "the typical March temperature at this station." |
 # MAGIC | 4 | **Leave null** | gaps > 30 days | A month or more of invented weather would be fiction; Gold decides how to handle these rows | Each imputed column gets a `<column>_source` column recording how every value was obtained.
 
 # COMMAND ----------
@@ -680,13 +726,13 @@ log("weather", "outlier (IQR on wet days)", "total_precip_mm",
 IMPUTE_COLS = ["max_temp_c", "min_temp_c", "mean_temp_c", "heat_deg_days_c", "cool_deg_days_c",
                "total_rain_mm", "total_snow_cm", "total_precip_mm"]
 
-pdf = weather_checked.select("climate_id", "date", *IMPUTE_COLS).toPandas()
+pdf = weather_checked.select("station", "date", *IMPUTE_COLS).toPandas()
 pdf["date"] = pd.to_datetime(pdf["date"])
-pdf = pdf.sort_values(["climate_id", "date"]).reset_index(drop=True)
+pdf = pdf.sort_values(["station", "date"]).reset_index(drop=True)
 pdf["month"] = pdf["date"].dt.month
 
 # One row per calendar day per station, so row order == time order
-assert (pdf.groupby("climate_id")["date"].diff().dropna() == pd.Timedelta(days=1)).all(), "calendar has gaps"
+assert (pdf.groupby("station")["date"].diff().dropna() == pd.Timedelta(days=1)).all(), "calendar has gaps"
 
 SOURCE_COLS = ["max_temp_c", "min_temp_c", "mean_temp_c", "total_precip_mm"]
 for c in SOURCE_COLS:
@@ -767,15 +813,15 @@ GROUP_MEAN_MAX_GAP = 30   # gaps of up to 30 days: station × month mean; longer
 
 def impute(col, interpolate):
     # for each row, how many consecutive missing values surround it
-    gaps = pdf.groupby("climate_id")[col].transform(gap_length)
+    gaps = pdf.groupby("station")[col].transform(gap_length)
     # the mean of all observed values for the same station in the same month
-    group_mean = pdf.groupby(["climate_id", "month"])[col].transform("mean")
+    group_mean = pdf.groupby(["station", "month"])[col].transform("mean")
 
 
     if interpolate:
         # draws a straight line between the last observed value before the gap and the first observed value after it.
         # limit_area="inside" means it only fills between observed values — it won't extrapolate past the last known value.
-        interp = pdf.groupby("climate_id")[col].transform(lambda s: s.interpolate(method="linear", limit_area="inside"))
+        interp = pdf.groupby("station")[col].transform(lambda s: s.interpolate(method="linear", limit_area="inside"))
         # the value is null AND the gap is ≤ 3 days AND interpolation produced a value 
         m = pdf[col].isna() & (gaps <= INTERP_MAX_GAP) & interp.notna()
         pdf.loc[m, col] = interp[m].round(1)
@@ -849,12 +895,12 @@ for c, expr in [("heat_deg_days_c", lambda t: np.maximum(0, 18 - t)), ("cool_deg
 
 # COMMAND ----------
 
-out_cols = ["climate_id", "date", *IMPUTE_COLS, *[f"{c}_source" for c in SOURCE_COLS]]
+out_cols = ["station", "date", *IMPUTE_COLS, *[f"{c}_source" for c in SOURCE_COLS]]
 
 # Convert pandas back to Spark
 imputed = spark.createDataFrame(pdf[out_cols])
 imputed = imputed.select(
-    "climate_id",
+    "station",
     F.col("date").cast("date").alias("date"),
     # pandas represents missing values as NaN, not null (Spark)
     *[F.when(~F.isnan(c), F.col(c)).alias(c) for c in IMPUTE_COLS],
@@ -862,7 +908,7 @@ imputed = imputed.select(
 )
 
 # Drops the old measure columns from weather_checked (they have the pre-imputation nulls) & Joins the imputed versions back
-silver_weather = weather_checked.drop(*IMPUTE_COLS).join(imputed, ["climate_id", "date"])
+silver_weather = weather_checked.drop(*IMPUTE_COLS).join(imputed, ["station", "date"])
 # Asserts the row count didn't change after imputation
 assert silver_weather.count() == weather_checked.count()
 
@@ -870,20 +916,20 @@ assert silver_weather.count() == weather_checked.count()
 # null_summary (defined earlier in the notebook) counts nulls per station for the 4 source columns.
 before = null_summary(weather_typed, SOURCE_COLS).withColumn("stage", F.lit("before"))
 after = null_summary(silver_weather, SOURCE_COLS).withColumn("stage", F.lit("after"))
-display(before.unionByName(after).orderBy("climate_id", F.desc("stage")))
+display(before.unionByName(after).orderBy("station", F.desc("stage")))
 
 
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC - **Lac Bouchette** has 0 group-mean fills because its gaps are either short (interpolated) or very long (station offline since 2016 — left null).
-# MAGIC - **Sorel** has 3,747 not-imputed values — the long offline period from Part 2.2
+# MAGIC - **Les Buissons** keeps the most `not_imputed` values: its 2013 and 2015 offline years (Part 2.2) are far longer than 30 days.
+# MAGIC - The 9 stations without 2025 data also keep that year as `not_imputed`; it is outside the fire period.
 
 # COMMAND ----------
 
 display(
-    silver_weather.groupBy("climate_id").pivot("max_temp_c_source").count().orderBy("climate_id")
+    silver_weather.groupBy("station").pivot("max_temp_c_source").count().orderBy("station")
 )
 
 # COMMAND ----------
@@ -891,7 +937,7 @@ display(
 # MAGIC %md
 # MAGIC # Part 3 — Write Silver tables
 # MAGIC
-# MAGIC Primary keys and the foreign key `weather_daily.climate_id → weather_stations.climate_id` are declared so Unity Catalog
+# MAGIC Primary keys and the foreign key `weather_daily.station → weather_stations.station` are declared so Unity Catalog
 # MAGIC can show the relationships (informational constraints — not enforced on write).
 
 # COMMAND ----------
@@ -920,13 +966,13 @@ def write_table(df, name, pk_cols, comment):
     print(f"{name}: {spark.table(name).count():,} rows")
 
 write_table(silver_fires, T_FIRES, ["fire_id"], "SOPFEU wildfire origin points 2000-2024, typed and checked")
-write_table(silver_stations, T_STATIONS, ["climate_id"], "ECCC weather stations (one row per station)")
-write_table(silver_weather, T_WEATHER, ["climate_id", "date"], "ECCC daily weather 2000-2025, typed, outliers flagged, nulls handled")
+write_table(silver_stations, T_STATIONS, ["station"], "ECCC weather stations (one row per station)")
+write_table(silver_weather, T_WEATHER, ["station", "date"], "ECCC daily weather 2000-2025, typed, outliers flagged, nulls handled")
 
-# Links weather_daily.climate_id → weather_stations.climate_id, so Unity Catalog can show the relationship in Data Explorer.
+# Links weather_daily.station → weather_stations.station, so Unity Catalog can show the relationship in Data Explorer.
 spark.sql(f"""
     ALTER TABLE {T_WEATHER} ADD CONSTRAINT fk_weather_station
-    FOREIGN KEY (climate_id) REFERENCES {T_STATIONS} (climate_id)
+    FOREIGN KEY (station) REFERENCES {T_STATIONS} (station)
 """)
 
 log_df = spark.createDataFrame(cleaning_log, "dataset STRING, step STRING, column STRING, rows_affected LONG, action STRING")
