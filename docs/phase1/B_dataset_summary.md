@@ -22,12 +22,16 @@ https://climate.weather.gc.ca/climate_data/bulk_data_e.html?format=csv&stationID
 
 `timeframe=2` selects daily data. The endpoint takes ECCC's internal *Station ID*. The publicly listed *Climate ID* was mapped to it using ECCC's [Station Inventory](https://collaboration.cmc.ec.gc.ca/cmc/climate/Get_More_Data_Plus_de_donnees/Station%20Inventory%20EN.csv) file.
 
-### Station selection
+### Hurdle: 3 stations were too few
 
-A first version of the dataset used 3 stations (Sorel, Lac Bouchette, Les Buissons), one per fire-dense region. Two problems led to replacing them with 30:
+The dataset was first collected with 3 stations (Sorel, Lac Bouchette, Les Buissons), one per fire-dense region. Checking them against the fires showed two problems:
 
 - **Distance.** The median fire was 185 km from its nearest station, and only 6% were within 50 km. Daily summer precipitation, which is mostly local thunderstorms, is only weakly related between stations more than about 50 km apart ([daily precipitation correlation study, Slovenia](https://dlib.si/URN:NBN:SI:doc-BEYLRKIR/EDM)), so a station 185 km away says little about rain at the fire.
 - **Gaps.** Lac Bouchette stopped reporting in 2016, so fires near it from 2016 to 2024 had no weather at all.
+
+The weather data was therefore re-collected with 30 stations.
+
+### Station selection
 
 The 30 stations were chosen in three steps:
 
