@@ -761,17 +761,25 @@ def gap_length(s):
 # MAGIC - `mean_temp_c`(FD1), 
 # MAGIC - `total_precip_mm`(FD2), 
 # MAGIC - `heat_deg_days_c` and `cool_deg_days_c`(FD3) `mean_temp_c` has been filled.  
+# MAGIC
+# MAGIC Two findings on the 30-station data:
+# MAGIC - **FD1 holds up to rounding.** When (max + min) / 2 ends in .x5, ECCC rounds away from zero before 2018 (2.65 → 2.7) and toward zero from 2018 (2.65 → 2.6). Every mismatch is exactly 0.05 °C, so the check allows ±0.05.
+# MAGIC - **FD2 does not hold everywhere.** Quebec/Jean Lesage Intl (14 days in January 2009) and Richmond (1 day) report precipitation that differs from rain + snow, e.g. 10 cm of snow but 6.9 mm of precipitation, because snow's water content is not always 1 mm per cm. Precipitation is therefore derived from rain + snow only at stations where the FD has no violations.
 
 # COMMAND ----------
 
-# FD1: mean = (max + min)/2 and rounds it the way ECCC does 
+# FD1: mean = (max + min)/2, rounded to 1 decimal in either direction (ECCC changed how it rounds .x5 in 2018)
 full = pdf.dropna(subset=["max_temp_c", "min_temp_c", "mean_temp_c"])
-# Compare against the actual mean_temp_c if the difference >0.01, it's a violation
-mean_fd_violations = int((round_half_away((full["max_temp_c"] + full["min_temp_c"]) / 2) - full["mean_temp_c"]).abs().gt(0.01).sum())
+# A difference of more than 0.05 (plus float noise) cannot come from rounding, so it is a violation
+mean_fd_violations = int(((full["max_temp_c"] + full["min_temp_c"]) / 2 - full["mean_temp_c"]).abs().gt(0.051).sum())
 
-# FD2: precip = rain + snow 
+# FD2: precip = rain + snow
 full_p = pdf.dropna(subset=["total_rain_mm", "total_snow_cm", "total_precip_mm"])
-precip_fd_violations = int((full_p["total_rain_mm"] + full_p["total_snow_cm"] - full_p["total_precip_mm"]).abs().gt(0.01).sum())
+precip_bad = (full_p["total_rain_mm"] + full_p["total_snow_cm"] - full_p["total_precip_mm"]).abs().gt(0.01)
+precip_fd_violations = int(precip_bad.sum())
+# Stations where the FD is violated at least once are not used for the FD2 derivation in Step 1b
+PRECIP_FD_EXCLUDED = sorted(full_p.loc[precip_bad, "station"].unique())
+display(full_p.loc[precip_bad, ["station", "date", "total_rain_mm", "total_snow_cm", "total_precip_mm"]])
 
 # FD3: Heating Degree Days (HDD) and Cooling Degree Days (CDD) | HDD/CDD from mean
 full_d = pdf.dropna(subset=["mean_temp_c", "heat_deg_days_c", "cool_deg_days_c"])
@@ -781,9 +789,11 @@ dd_fd_violations = int(
 )
 
 print(f"mean = (max + min) / 2       : {mean_fd_violations} violations in {len(full):,} complete rows")
-print(f"precip = rain + snow         : {precip_fd_violations} violations in {len(full_p):,} complete rows")
+print(f"precip = rain + snow         : {precip_fd_violations} violations in {len(full_p):,} complete rows, at {PRECIP_FD_EXCLUDED}")
 print(f"HDD = max(0, 18 - mean), CDD : {dd_fd_violations} violations in {len(full_d):,} complete rows")
-assert mean_fd_violations == 0 and precip_fd_violations == 0 and dd_fd_violations == 0
+assert mean_fd_violations == 0 and dd_fd_violations == 0
+# FD2 only has to hold at the stations it will be used for
+assert not (precip_bad & ~full_p["station"].isin(PRECIP_FD_EXCLUDED)).any()
 
 # COMMAND ----------
 
@@ -792,8 +802,9 @@ assert mean_fd_violations == 0 and precip_fd_violations == 0 and dd_fd_violation
 
 # COMMAND ----------
 
-#Find rows where precipitation is missing but its components exist
-m = pdf["total_precip_mm"].isna() & pdf["total_rain_mm"].notna() & pdf["total_snow_cm"].notna()
+#Find rows where precipitation is missing but its components exist, at stations where FD2 holds
+m = (pdf["total_precip_mm"].isna() & pdf["total_rain_mm"].notna() & pdf["total_snow_cm"].notna()
+     & ~pdf["station"].isin(PRECIP_FD_EXCLUDED))
 # Select a subset of rows where m holds true, and column 
 pdf.loc[m, "total_precip_mm"] = pdf.loc[m, "total_rain_mm"] + pdf.loc[m, "total_snow_cm"]
 # Tag the source
