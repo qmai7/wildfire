@@ -169,7 +169,7 @@ The diagram has one entity per collected dataset. The dashed line marks a relati
 | Source columns | 12 attributes + 1 geometry = **13** | **31** (20 descriptors/dates/measures + 11 flags) | **44** |
 | Rows | **44,471** fires (1972–2024) | **284,910** station-days | **329,381** |
 | Rows in project scope | 15,078 fires (2000–2024) | 284,910 (2000–2025) | 299,988 |
-| Bronze Delta table | `bronze.fires_raw` — 15 columns², 1.10 MB | `bronze.weather_daily_raw` — 33 columns², *size to be measured after re-ingestion* | 2 tables |
+| Bronze Delta table | `bronze.fires_raw` — 15 columns², 1.10 MB | `bronze.weather_daily_raw` — 33 columns², 2.04 MB | 2 tables, 3.14 MB |
 
 MB = 10⁶ bytes.
 ¹ The weather zip is built by `scripts/download_weather.py`, so the 780 files can be uploaded in one step.
