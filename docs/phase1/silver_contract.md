@@ -66,7 +66,7 @@ Foreign key: `weather_daily.station → weather_stations.station`
 | `max_temp_c ≥ min_temp_c` wherever both exist | asserted |
 | `mean_temp_c = (max + min) / 2`, within the 0.05 °C of ECCC rounding (ECCC rounds .x5 away from zero before 2018 and toward zero from 2018; filled rows round away from zero); heating/cooling degree days = max(0, 18 − mean) / max(0, mean − 18) | asserted on observed rows, by construction on filled rows |
 | `total_precip_mm` filled from rain + snow only at stations where precip = rain + snow holds on every complete row (excludes Quebec/Jean Lesage Intl and Richmond) | asserted |
-| `max_temp_c`, `min_temp_c`, `mean_temp_c` and `total_precip_mm` each have a `<column>_source`: `observed`, `fd_derived`, `fd_from_imputed`, `interpolated`, `station_month_mean` or `not_imputed` | by construction |
+| `max_temp_c`, `min_temp_c`, `mean_temp_c` and `total_precip_mm` each have a `<column>_source`: `observed`, `fd_derived` (mean from observed max/min), `fd_from_imputed` (mean from imputed max/min), `fd1_derived` (precipitation from rain + snow), `interpolated`, `station_month_mean` or `not_imputed` | by construction |
 | `max_temp_outlier`, `min_temp_outlier` and `precip_outlier` are non-null booleans; flagged rows are kept | by construction |
 | `spd_of_max_gust_below_31` is a non-null boolean; every non-numeric gust speed in Bronze was `<31` | asserted |
 
