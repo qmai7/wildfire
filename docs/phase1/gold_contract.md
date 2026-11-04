@@ -42,24 +42,29 @@ Both model tables have the same features. ✓ = the column is in that table.
 | `windy_days_7d` | feature | Days with a gust ≥ 31 km/h in the 7 days before Monday (0–7) | ✓ | ✓ |
 | `fires_prev_4wk` | feature | Fires in the cell in the 4 weeks before this week | ✓ | ✓ |
 | `fires_prev_52wk` | feature | Fires in the cell in the 52 weeks before this week | ✓ | ✓ |
-| `cell_fire_rate_prior` | feature | Fires per year in the cell over all earlier weeks since 2000 | ✓ | ✓ |
-| `cell_lightning_share_prior` | feature | Share of the cell's earlier fires caused by lightning (0–1) | ✓ | ✓ |
+| `cell_fire_rate_prior` | feature | Average number of fires per year, from 2000 before this week. It measures how fire-prone the cell is in general | ✓ | ✓ |
+| `cell_lightning_share_prior` | feature | Proportion of the cell's earlier fires caused by lightning (0–1) before this week | ✓ | ✓ |
 | `has_fire` | **target** | At least one Intensive-zone fire started in the cell that week | ✓ | |
 | `is_lightning` | **target** | The fire was caused by lightning (false = human-caused) | | ✓ |
 
 Only the `feature` columns are model inputs.
 
-## `gold.grid_cells` columns
+## `gold.grid_cells`
+
+The list of grid cells the project covers, one row per cell. Québec is divided into 0.5° × 0.5° cells (about 55 km
+north-south by 39 km east-west in southern Québec), and every cell with at least one Intensive-zone fire in 2000–2024 is
+listed. It is a lookup table, not a model input: the dashboard joins predictions to it by `cell_id` to place each cell on
+the map, and `in_model` marks the cells the models cover.
 
 | Column | Description |
 |---|---|
 | `cell_id` | Grid cell, named by its south-west corner (e.g. `45.0_-72.5`) |
 | `cell_lat`, `cell_lon` | South-west corner of the cell (degrees) |
 | `center_lat`, `center_lon` | Centre of the cell (degrees) |
-| `fires_2000_2024` | Intensive-zone fires in the cell, 2000–2024 |
-| `lightning_fires_2000_2024` | Of those, fires caused by lightning |
-| `nearest_station`, `nearest_station_km` | Nearest weather station to the cell centre, and its distance (km) |
-| `in_model` | The cell is covered by the models (its nearest station is within 300 km) |
+| `fires_2000_2024` | Number of Intensive-zone fires in the cell, between 2000 and 2024 |
+| `lightning_fires_2000_2024` | Of those count above, number of fires caused by lightning |
+| `nearest_station`, `nearest_station_km` | Name of Nearest weather station to the cell centre, and its distance (km) |
+| `in_model` | The cell is covered by the models (b/c its nearest station is within 300 km of the cell centre) |
 
 ## Rules
 
