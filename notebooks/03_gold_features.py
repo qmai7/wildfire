@@ -67,7 +67,7 @@ def write_table(df, name, pk_cols, comment):
 # MAGIC | `days_since_rain` | Days since the last day with ≥ 1 mm (1 = it rained on Sunday) | Length of the current dry spell |
 # MAGIC | `max_temp_7d_mean_c` | Mean daily high over the 7 days before Monday | A run of hot days dries fuel faster than one hot day |
 # MAGIC | `windy_days_7d` | Days with a gust ≥ 31 km/h in the 7 days before Monday | Wind dries fuel and spreads fire. A `<31` day counts as calm, not missing |
-# MAGIC | `*_observed_share` | Share of the window's days whose value was observed rather than imputed in Silver | Shows how much of a feature rests on filled values |
+# MAGIC | `*_observed_share` | Share of the window's days whose value was observed rather than imputed in Silver | A data-quality check on the features above: displayed below, not saved |
 # MAGIC
 # MAGIC A window feature is null when fewer than 80% of its days have a value. `days_since_rain` is null when there is a
 # MAGIC precipitation gap after the last rain day, because the dry spell's length is then unknown.
@@ -115,8 +115,14 @@ monday_weather = (
     .withColumn("has_weather", F.col("precip_7d_mm").isNotNull() & F.col("max_temp_7d_mean_c").isNotNull())
 )
 
-WEATHER_FEATURES = [c for c in monday_weather.columns if c not in ("station", "week_start", "has_weather")]
+WEATHER_FEATURES = ["precip_7d_mm", "precip_14d_mm", "precip_30d_mm", "days_since_rain", "max_temp_7d_mean_c", "windy_days_7d"]
+OBSERVED_SHARES = [c for c in monday_weather.columns if c.endswith("_observed_share")]
 display(monday_weather.filter("week_start = '2023-06-05'").orderBy("station"))
+
+# COMMAND ----------
+
+# Average share of observed (not imputed) days behind each feature, over all station-Mondays in the season
+display(monday_weather.agg(*[F.round(F.avg(c), 3).alias(c) for c in OBSERVED_SHARES]))
 
 # COMMAND ----------
 
@@ -231,13 +237,12 @@ all_weeks = spark.sql("SELECT explode(sequence(DATE'2000-01-03', DATE'2024-12-30
 fire_weeks = fires.groupBy("cell_id", "week_start").agg(
     F.count("*").alias("fire_count"),
     F.sum((F.col("cause") == "Lightning").cast("int")).alias("lightning_count"),
-    F.sum((F.col("cause") == "Human").cast("int")).alias("human_count"),
 )
 
 calendar = (
     grid_cells.select("cell_id").crossJoin(all_weeks)
     .join(fire_weeks, ["cell_id", "week_start"], "left")
-    .fillna(0, ["fire_count", "lightning_count", "human_count"])
+    .fillna(0, ["fire_count", "lightning_count"])
 )
 
 w_week = Window.partitionBy("cell_id").orderBy("week_start")
@@ -245,7 +250,7 @@ prev4, prev52 = w_week.rowsBetween(-4, -1), w_week.rowsBetween(-52, -1)
 prior = w_week.rowsBetween(Window.unboundedPreceding, -1)
 
 history = calendar.select(
-    "cell_id", "week_start", "fire_count", "lightning_count", "human_count",
+    "cell_id", "week_start", "fire_count",
     F.sum("fire_count").over(prev4).alias("fires_prev_4wk"),
     F.when(F.count("*").over(prev52) == 52, F.sum("fire_count").over(prev52)).alias("fires_prev_52wk"),
     F.when(F.count("*").over(prior) >= 52,
@@ -255,6 +260,7 @@ history = calendar.select(
 ).fillna(0, ["fires_prev_4wk"])
 
 HISTORY_FEATURES = ["fires_prev_4wk", "fires_prev_52wk", "cell_fire_rate_prior", "cell_lightning_share_prior"]
+FEATURES = ["week_of_year", "center_lat", "center_lon", *WEATHER_FEATURES, *HISTORY_FEATURES]   # the inputs of both models
 
 # COMMAND ----------
 
@@ -264,6 +270,9 @@ HISTORY_FEATURES = ["fires_prev_4wk", "fires_prev_52wk", "cell_fire_rate_prior",
 # MAGIC One row per cell per week whose Monday falls in April–October, 2000–2024, including weeks with no fire.
 # MAGIC Label: `has_fire` (at least one Intensive-zone fire started in the cell that week). This is where the spatial join
 # MAGIC (cell → station) and the temporal join (station → weather before that Monday) happen.
+# MAGIC
+# MAGIC Columns: the key (`cell_id`, `week_start`), `year` for the time-based split, `station` and `station_km` from the
+# MAGIC spatial join, the features (`FEATURES`) and the label. The table holds nothing else, so it can be passed to a model as is.
 
 # COMMAND ----------
 
@@ -278,14 +287,10 @@ hotspot_features = (
     season
     .withColumn("year", F.year("week_start"))
     .withColumn("week_of_year", F.weekofyear("week_start"))
-    .withColumn("month", F.month("week_start"))
     .withColumn("has_fire", F.col("fire_count") > 0)
     .join(cell_station, ["cell_id", "week_start"], "left")
-    .join(monday_weather.drop("has_weather"), ["station", "week_start"], "left")
-    .select(
-        "cell_id", "week_start", "year", "month", "week_of_year", "center_lat", "center_lon", "station", "station_km",
-        *WEATHER_FEATURES, *HISTORY_FEATURES, "fire_count", "lightning_count", "human_count", "has_fire",
-    )
+    .join(monday_weather.select("station", "week_start", *WEATHER_FEATURES), ["station", "week_start"], "left")
+    .select("cell_id", "week_start", "year", "station", "station_km", *FEATURES, "has_fire")
 )
 
 write_table(hotspot_features, f"{GOLD}.hotspot_features", ["cell_id", "week_start"],
@@ -300,7 +305,7 @@ assert hotspot_features.select("cell_id", "week_start").distinct().count() == n_
 # Fires whose week starts outside April–October have no row (late March / early November), nor do fires in cells left out
 n_fires = fires.count()
 in_panel = fires.filter(F.month("week_start").between(*SEASON_MONTHS)).join(model_cells, "cell_id").count()
-assert hotspot_features.agg(F.sum("fire_count")).first()[0] == in_panel, "fire counts do not add up"
+assert season.agg(F.sum("fire_count")).first()[0] == in_panel, "fire counts do not add up"
 print(f"{n_cells} cells x {n_weeks} weeks = {n_rows:,} rows")
 print(f"{in_panel:,} of {n_fires:,} fires are in the panel; the rest start in a week outside April–October or in a cell left out")
 
@@ -323,7 +328,7 @@ display(hotspot_features.agg(
 display(
     hotspot_features.filter("cell_id = '45.0_-72.5' AND week_start BETWEEN '2023-05-29' AND '2023-06-19'")
     .select("cell_id", "week_start", "station", "precip_7d_mm", "precip_30d_mm", "days_since_rain", "max_temp_7d_mean_c",
-            "fires_prev_4wk", "fire_count", "has_fire")
+            "fires_prev_4wk", "has_fire")
     .orderBy("week_start")
 )
 
@@ -332,24 +337,19 @@ display(
 # MAGIC %md
 # MAGIC # Part 6 — `gold.fire_weather` (Model 2: cause)
 # MAGIC
-# MAGIC One row per fire that has a row in `hotspot_features`, carrying that cell-week's features. Label: `is_lightning`.
+# MAGIC One row per fire that has a row in `hotspot_features`, carrying that cell-week's features. Label: `is_lightning`
+# MAGIC (false = human-caused).
 # MAGIC
-# MAGIC Model 2's inputs are the cell-week columns (station, weather, history, `center_lat`/`center_lon`, `week_of_year`, `month`).
-# MAGIC The fire's own `start_date`, `latitude`, `longitude` and `area_ha` are kept for description only: none of them is known
-# MAGIC on the Monday when the model is used.
+# MAGIC Same columns as `hotspot_features`, with `fire_id` as the key and `is_lightning` as the label. The fire's own date,
+# MAGIC location and area are not included: none of them is known on the Monday when the model is used.
 
 # COMMAND ----------
 
 fire_weather = (
-    fires.select(
-        "fire_id", "cell_id", "week_start", "start_date", "latitude", "longitude", "area_ha", "area_ha_outlier",
-        "cause", (F.col("cause") == "Lightning").alias("is_lightning"),
-    )
-    .join(
-        hotspot_features.select("cell_id", "week_start", "year", "month", "week_of_year", "center_lat", "center_lon",
-                                "station", "station_km", *WEATHER_FEATURES, *HISTORY_FEATURES),
-        ["cell_id", "week_start"],
-    )
+    fires.select("fire_id", "cell_id", "week_start", (F.col("cause") == "Lightning").alias("is_lightning"))
+    .join(hotspot_features.select("cell_id", "week_start", "year", "station", "station_km", *FEATURES),
+          ["cell_id", "week_start"])
+    .select("fire_id", "cell_id", "week_start", "year", "station", "station_km", *FEATURES, "is_lightning")
 )
 
 write_table(fire_weather, f"{GOLD}.fire_weather", ["fire_id"],
@@ -376,6 +376,6 @@ display(fire_weather.agg(
 
 display(
     fire_weather.filter(F.col("fire_id") == "20221080001")
-    .select("fire_id", "start_date", "week_start", "cause", "cell_id", "station", "station_km",
+    .select("fire_id", "week_start", "is_lightning", "cell_id", "station", "station_km",
             "precip_7d_mm", "days_since_rain", "max_temp_7d_mean_c", "windy_days_7d", "fires_prev_52wk")
 )

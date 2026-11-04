@@ -1,8 +1,6 @@
 # Project Proposal: Forecasting Wildfire Hotspots and Cause in Quebec
 
-**Author:** Quan
-**Course:** COMP333 — Data Analytics
-**Platform:** Databricks Free Edition + Power BI
+**Author:** Quan | **Course:** COMP333 — Data Analytics | **Platform:** Databricks + Power BI
 
 ---
 
@@ -20,7 +18,7 @@ This project integrates **two independently sourced datasets**, which is a core 
 
 **2. Historical daily weather — Environment and Climate Change Canada.** Daily temperature (max/min/mean) and precipitation data from **30 weather stations**, 2000–2025, selected for complete fire-season data and proximity to past fires. Station list and selection method: [docs/phase1/B_dataset_summary.md](docs/phase1/B_dataset_summary.md).
 
-**Scope: Intensive protection zone only.** SOPFEU divides Québec into an Intensive zone in the south and a Nordic zone in the north. We do not have enough weather data to model fires in the Nordic zone (they are a median **399 km** from the nearest station), so both models cover the **Intensive zone only (13,665 fires, 2000–2024)**. Nordic-zone fires stay in the cleaned data as historical records.
+**Scope: Intensive protection zone only.** SOPFEU divides Québec into an Intensive zone in the south and a Nordic zone in the north. We do not have enough weather data to model fires in the Nordic zone (they have a median **399 km** from the nearest station), so both models cover the **Intensive zone only (13,665 fires, 2000–2024)**. Nordic-zone fires stay in the cleaned data as historical records.
 
 ## 3. Objectives
 
