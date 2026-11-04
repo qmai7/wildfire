@@ -2,6 +2,7 @@
 *.zip
 weather/
 data/
+CLAUDE.md
 
 # Python / IDE
 __pycache__/
